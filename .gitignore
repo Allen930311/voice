@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.icns
+Assets.car
+
+# Directories
+data/
+output/
+sample/
+__pycache__/
+.venv/
+
+# Python
+*.py[cod]
+*$py.class
+
+# Misc
+upload_log.txt
+status.json
+status_utf8.json
+payload.json
+.DS_Store
+Thumbs.db
