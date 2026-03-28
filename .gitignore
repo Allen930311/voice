@@ -5,10 +5,13 @@ Assets.car
 
 # Directories
 data/
+bin/
 output/
 sample/
 __pycache__/
 .venv/
+scripts/debug/
+diary/
 
 # Python
 *.py[cod]
