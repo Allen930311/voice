@@ -89,7 +89,10 @@ def bench_ov_device(core, model_pt, device_id: str, n_runs: int, seq_len: int) -
     print(f"    convert→{device_id}… ", end="", flush=True)
     try:
         t0 = time.perf_counter()
-        ov_model = ov.convert_model(model_pt, example_input=dummy)
+        import torch
+        with torch.no_grad():
+            traced = torch.jit.trace(model_pt, dummy)
+        ov_model = ov.convert_model(traced, example_input=dummy)
         compiled  = core.compile_model(ov_model, device_id)
         compile_ms = (time.perf_counter() - t0) * 1000
         infer_req  = compiled.create_infer_request()
