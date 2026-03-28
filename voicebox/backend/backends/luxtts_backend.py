@@ -30,7 +30,7 @@ class LuxTTSBackend:
         self._device = None
 
     def _get_device(self) -> str:
-        return get_torch_device(allow_mps=True)
+        return get_torch_device(allow_mps=True, allow_xpu=True, allow_directml=True)
 
     def is_loaded(self) -> bool:
         return self.model is not None

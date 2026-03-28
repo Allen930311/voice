@@ -29,10 +29,26 @@ class PyTorchTTSBackend:
         self.model_size = model_size
         self.device = self._get_device()
         self._current_model_size = None
+        self._log_device()
 
     def _get_device(self) -> str:
         """Get the best available device."""
         return get_torch_device(allow_xpu=True, allow_directml=True)
+
+    def _log_device(self):
+        """Log selected device and hint at available OpenVINO devices."""
+        logger.info("Qwen TTS device: %s", self.device)
+        try:
+            from .ov_accelerate import get_best_ov_device
+            ov_dev = get_best_ov_device()
+            if ov_dev and self.device == "cpu":
+                logger.info(
+                    "OpenVINO %s detected but Qwen TTS uses custom qwen_tts pipeline; "
+                    "XPU/DirectML will be used when available.",
+                    ov_dev,
+                )
+        except Exception:
+            pass
 
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
@@ -240,6 +256,7 @@ class PyTorchSTTBackend:
         self.processor = None
         self.model_size = model_size
         self.device = self._get_device()
+        self._using_ov = False  # True when loaded via optimum-intel OpenVINO
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -272,20 +289,44 @@ class PyTorchSTTBackend:
     load_model = load_model_async
 
     def _load_model_sync(self, model_size: str):
-        """Synchronous model loading."""
+        """Synchronous model loading — tries OpenVINO GPU first, falls back to PyTorch."""
         progress_model_name = f"whisper-{model_size}"
         is_cached = self._is_model_cached(model_size)
+        model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
 
         with model_load_progress(progress_model_name, is_cached):
-            from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
-            model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
-            logger.info("Loading Whisper model %s on %s...", model_size, self.device)
-
+            from transformers import WhisperProcessor
             self.processor = WhisperProcessor.from_pretrained(model_name)
-            self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
 
-        self.model.to(self.device)
+            # ── Try OpenVINO (optimum-intel) ──────────────────────────────────
+            ov_loaded = False
+            try:
+                from .ov_accelerate import get_best_ov_device
+                from optimum.intel import OVModelForSpeechSeq2Seq
+                ov_dev = get_best_ov_device()
+                if ov_dev:
+                    logger.info("Loading Whisper %s via optimum-intel on OpenVINO %s…",
+                                model_size, ov_dev)
+                    self.model = OVModelForSpeechSeq2Seq.from_pretrained(
+                        model_name,
+                        export=True,
+                        device=ov_dev,
+                    )
+                    self.device = "cpu"   # OV model reads CPU tensors internally
+                    self._using_ov = True
+                    ov_loaded = True
+                    logger.info("Whisper %s loaded on OpenVINO %s", model_size, ov_dev)
+            except Exception as e:
+                logger.warning("OpenVINO Whisper load failed (%s); falling back to PyTorch", e)
+
+            # ── PyTorch fallback ──────────────────────────────────────────────
+            if not ov_loaded:
+                from transformers import WhisperForConditionalGeneration
+                logger.info("Loading Whisper model %s on %s...", model_size, self.device)
+                self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
+                self.model.to(self.device)
+                self._using_ov = False
+
         self.model_size = model_size
         logger.info("Whisper model %s loaded successfully", model_size)
 

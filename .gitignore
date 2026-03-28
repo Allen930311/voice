@@ -19,8 +19,17 @@ diary/
 
 # Misc
 upload_log.txt
+status.txt
 status.json
 status_utf8.json
 payload.json
 .DS_Store
 Thumbs.db
+.auto-skill-local.md
+voicebox/backend/venv*/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+*.log

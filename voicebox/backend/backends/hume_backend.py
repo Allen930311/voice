@@ -66,7 +66,7 @@ class HumeTadaBackend:
     def _get_device(self) -> str:
         # Force CPU on macOS — MPS has issues with flow matching
         # and large vocab lm_head (>65536 output channels)
-        return get_torch_device(force_cpu_on_mac=True)
+        return get_torch_device(force_cpu_on_mac=True, allow_xpu=True, allow_directml=True)
 
     def is_loaded(self) -> bool:
         return self.model is not None
