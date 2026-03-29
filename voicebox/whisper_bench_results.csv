@@ -1,0 +1,10 @@
+Model,Device,AvgTime,RTF
+tiny,cpu-PT,5.36,5.22
+tiny,CPU-OV,8.62,3.25
+tiny,GPU-OV,4.45,6.29
+base,cpu-PT,7.70,3.64
+base,CPU-OV,14.08,1.99
+base,GPU-OV,7.31,3.83
+small,cpu-PT,12.67,2.21
+small,CPU-OV,26.19,1.07
+small,GPU-OV,6.62,4.23

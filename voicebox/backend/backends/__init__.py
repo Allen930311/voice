@@ -13,26 +13,7 @@ import numpy as np
 
 from ..utils.platform_detect import get_backend_type
 
-LANGUAGE_CODE_TO_NAME = {
-    "zh": "chinese",
-    "en": "english",
-    "ja": "japanese",
-    "ko": "korean",
-    "de": "german",
-    "fr": "french",
-    "ru": "russian",
-    "pt": "portuguese",
-    "es": "spanish",
-    "it": "italian",
-}
-
-WHISPER_HF_REPOS = {
-    "base": "openai/whisper-base",
-    "small": "openai/whisper-small",
-    "medium": "openai/whisper-medium",
-    "large": "openai/whisper-large-v3",
-    "turbo": "openai/whisper-large-v3-turbo",
-}
+from .constants import LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
 
 
 @dataclass
@@ -527,7 +508,7 @@ def get_stt_backend() -> STTBackend:
     Get or create STT backend instance based on platform.
 
     Returns:
-        STT backend instance (MLX or PyTorch)
+        STT backend instance (MLX, OpenVINO, or PyTorch)
     """
     global _stt_backend
 
@@ -536,11 +517,12 @@ def get_stt_backend() -> STTBackend:
 
         if backend_type == "mlx":
             from .mlx_backend import MLXSTTBackend
-
             _stt_backend = MLXSTTBackend()
+        elif backend_type == "openvino":
+            from .ov_accelerate import OVSTTBackend
+            _stt_backend = OVSTTBackend()
         else:
             from .pytorch_backend import PyTorchSTTBackend
-
             _stt_backend = PyTorchSTTBackend()
 
     return _stt_backend

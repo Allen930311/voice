@@ -49,7 +49,7 @@ from urllib.parse import quote
 from . import __version__, config, database
 from .services import tts, transcribe
 from .database import get_db
-from .utils.platform_detect import get_backend_type
+from .utils.platform_detect import get_backend_type, is_openvino_available
 from .utils.progress import get_progress_manager
 from .services.task_queue import create_background_task, init_queue
 from .routes import register_routers
@@ -153,8 +153,9 @@ def _get_gpu_status() -> str:
         return f"CUDA ({device_name})"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "MPS (Apple Silicon)"
-    elif backend_type == "mlx":
-        return "Metal (Apple Silicon via MLX)"
+    elif is_openvino_available():
+        # OpenVINO is our primary acceleration on Intel Windows
+        return "OpenVINO (Intel Arc GPU/NPU Acceleration)"
     return "None (CPU only)"
 
 

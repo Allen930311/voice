@@ -4,13 +4,15 @@ PyTorch backend implementation for TTS and STT.
 
 from typing import Optional, List, Tuple
 import asyncio
+import os
 import logging
 import torch
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
+from . import TTSBackend, STTBackend
+from .constants import WHISPER_HF_REPOS, LANGUAGE_CODE_TO_NAME
 from .base import (
     is_model_cached,
     get_torch_device,
@@ -119,11 +121,22 @@ class PyTorchTTSBackend:
                     low_cpu_mem_usage=False,
                 )
             else:
-                self.model = Qwen3TTSModel.from_pretrained(
-                    model_path,
-                    device_map=self.device,
-                    torch_dtype=torch.bfloat16,
-                )
+                try:
+                    self.model = Qwen3TTSModel.from_pretrained(
+                        model_path,
+                        device_map=self.device,
+                        torch_dtype=torch.bfloat16,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "TTS load on %s failed (%s), retrying on CPU...", self.device, e
+                    )
+                    self.device = "cpu"
+                    self.model = Qwen3TTSModel.from_pretrained(
+                        model_path,
+                        torch_dtype=torch.float32,
+                        low_cpu_mem_usage=False,
+                    )
 
         self._current_model_size = model_size
         self.model_size = model_size
@@ -242,8 +255,21 @@ class PyTorchTTSBackend:
             )
             return wavs[0], sample_rate
 
-        # Run blocking inference in thread pool to avoid blocking event loop
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        # Run blocking inference; if GPU fails at runtime, reload on CPU and retry
+        try:
+            audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        except Exception as e:
+            if self.device != "cpu":
+                logger.warning(
+                    "TTS generate on %s failed (%s), reloading on CPU...", self.device, e
+                )
+                current_size = self._current_model_size or self.model_size
+                self.unload_model()
+                self.device = "cpu"
+                await self.load_model_async(current_size)
+                audio, sample_rate = await asyncio.to_thread(_generate_sync)
+            else:
+                raise
 
         return audio, sample_rate
 
@@ -256,7 +282,7 @@ class PyTorchSTTBackend:
         self.processor = None
         self.model_size = model_size
         self.device = self._get_device()
-        self._using_ov = False  # True when loaded via optimum-intel OpenVINO
+        self.is_ov_accelerated = False
 
     def _get_device(self) -> str:
         """Get the best available device."""
@@ -289,46 +315,55 @@ class PyTorchSTTBackend:
     load_model = load_model_async
 
     def _load_model_sync(self, model_size: str):
-        """Synchronous model loading — tries OpenVINO GPU first, falls back to PyTorch."""
+        """同步載入模型：針對模型大小進行設備路由(Tiny->CPU, 其它->OV/PT)。"""
         progress_model_name = f"whisper-{model_size}"
         is_cached = self._is_model_cached(model_size)
-        model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
+        model_id = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
 
         with model_load_progress(progress_model_name, is_cached):
-            from transformers import WhisperProcessor
-            self.processor = WhisperProcessor.from_pretrained(model_name)
+            from transformers import WhisperProcessor, WhisperForConditionalGeneration
+            self.processor = WhisperProcessor.from_pretrained(model_id)
 
-            # ── Try OpenVINO (optimum-intel) ──────────────────────────────────
-            ov_loaded = False
-            try:
-                from .ov_accelerate import get_best_ov_device
-                from optimum.intel import OVModelForSpeechSeq2Seq
-                ov_dev = get_best_ov_device()
-                if ov_dev:
-                    logger.info("Loading Whisper %s via optimum-intel on OpenVINO %s…",
-                                model_size, ov_dev)
-                    self.model = OVModelForSpeechSeq2Seq.from_pretrained(
-                        model_name,
-                        export=True,
-                        device=ov_dev,
-                    )
-                    self.device = "cpu"   # OV model reads CPU tensors internally
-                    self._using_ov = True
-                    ov_loaded = True
-                    logger.info("Whisper %s loaded on OpenVINO %s", model_size, ov_dev)
-            except Exception as e:
-                logger.warning("OpenVINO Whisper load failed (%s); falling back to PyTorch", e)
+            # 1. 設備路由與加速邏輯
+            # 根據 Benchmark，tiny 模型走 CPU 開銷最小；其餘模型嘗試 OpenVINO GPU/NPU
+            use_ov = False
+            is_tiny = "tiny" in model_size.lower()
+            
+            enable_npu = os.environ.get("ENABLE_EXPERIMENTAL_NPU", "0") == "1"
+            
+            if is_tiny:
+                logger.info("Tiny model detected: using standard PyTorch CPU for optimal low-latency (Bench: RTF 0.05-0.08x)")
+                use_ov = False
+            else:
+                try:
+                    logger.info("OpenVINO: Attempting acceleration for %s (NPU Experimental: %s)", model_size, enable_npu)
+                    from .ov_accelerate import get_best_ov_device, safe_load_ov_model
+                    target_device = get_best_ov_device(exclude_npu=not enable_npu)
+                    
+                    if target_device and target_device != "CPU":
+                        logger.info("OpenVINO: Found accelerator %s, routing %s...", target_device, model_size)
+                        self.model = safe_load_ov_model(model_id, "stt", device=target_device)
+                        self.device = "cpu"  # OV 模型內部處理設備，輸入維持在 CPU
+                        self.is_ov_accelerated = True
+                        use_ov = True
+                    else:
+                        logger.info("OpenVINO: No hardware accelerator found or forced to CPU; staying on PyTorch Native.")
+                except Exception as e:
+                    import traceback
+                    logger.warning("OpenVINO load failed: %s", str(e))
+                    logger.debug("OpenVINO Error Stack: %s", traceback.format_exc())
+                    logger.info("Falling back to native PyTorch CPU mode.")
 
-            # ── PyTorch fallback ──────────────────────────────────────────────
-            if not ov_loaded:
-                from transformers import WhisperForConditionalGeneration
-                logger.info("Loading Whisper model %s on %s...", model_size, self.device)
-                self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
-                self.model.to(self.device)
-                self._using_ov = False
+            # 2. PyTorch Fallback
+            if not use_ov:
+                logger.info("Loading Whisper model %s on CPU (Standard PyTorch)...", model_size)
+                self.model = WhisperForConditionalGeneration.from_pretrained(model_id)
+                self.model.to("cpu")
+                self.device = "cpu"
+                self.is_ov_accelerated = False
 
         self.model_size = model_size
-        logger.info("Whisper model %s loaded successfully", model_size)
+        logger.info("Whisper model %s loaded successfully (OV: %s)", model_size, self.is_ov_accelerated)
 
     def unload_model(self):
         """Unload the model to free memory."""
@@ -399,5 +434,17 @@ class PyTorchSTTBackend:
 
             return transcription.strip()
 
-        # Run blocking transcription in thread pool
-        return await asyncio.to_thread(_transcribe_sync)
+        # Run blocking transcription; if OV inference fails at runtime, reload on CPU
+        try:
+            return await asyncio.to_thread(_transcribe_sync)
+        except Exception as e:
+            if self.is_ov_accelerated:
+                logger.warning(
+                    "OV STT runtime inference failed (%s), reloading with PyTorch CPU...", e
+                )
+                self.unload_model()
+                self.is_ov_accelerated = False
+                target_size = model_size or self.model_size
+                await asyncio.to_thread(self._load_model_sync, target_size)
+                return await asyncio.to_thread(_transcribe_sync)
+            raise

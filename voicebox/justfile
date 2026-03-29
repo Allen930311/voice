@@ -128,6 +128,15 @@ dev-backend: _ensure-venv
 dev-backend: _ensure-venv
     & "{{ python }}" -m uvicorn backend.main:app --reload --port 17493
 
+# Start backend with Intel Arc GPU (Python 3.12 + DirectML + OpenVINO)
+# venv312 path: C:\Users\Allen\AppData\Local\voicebox-venv312
+[windows]
+dev-backend-gpu:
+    $gpu_python = "C:\Users\Allen\AppData\Local\voicebox-venv312\Scripts\python.exe"; \
+    if (-not (Test-Path $gpu_python)) { throw "GPU venv not found: $gpu_python. Run: py -3.12 -m venv C:\Users\Allen\AppData\Local\voicebox-venv312" }; \
+    Write-Host "Starting backend with Intel Arc GPU (DirectML + OpenVINO)..."; \
+    & $gpu_python -m uvicorn backend.main:app --reload --port 17493
+
 # Start Tauri desktop app only (backend must be running separately)
 [unix]
 dev-frontend: _ensure-sidecar
