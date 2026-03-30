@@ -1,88 +1,61 @@
-import httpx
+import requests
+import time
 import os
-import asyncio
-from pathlib import Path
 
 BASE_URL = "http://127.0.0.1:17493"
-AUDIO_PATH = r"c:\Users\Allen\OneDrive\Desktop\Voicebox\sample.wav"
+PROFILE_ID = "f9b3a288-2e86-4156-8dfd-42b70ece7283"
+TEXT = "this is not a good deal"
+OUTPUT_PATH = "output/this-is-not-a-good-deal.wav"
 
-async def test_flow():
-    async with httpx.AsyncClient(timeout=600) as client:
-        # 1. Transcribe
-        print("Transcribing...")
-        with open(AUDIO_PATH, "rb") as f:
-            try:
-                r = await client.post(f"{BASE_URL}/transcribe", files={"file": ("sample.wav", f, "audio/wav")}, data={"language": "zh", "model": "base"})
-                r.raise_for_status()
-            except httpx.HTTPStatusError as e:
-                print(f"Error: {e.response.status_code}")
-                print(f"Detail: {e.response.text}")
-                return
-        ref_text = r.json().get("text", "")
-        print(f"Transcription: {ref_text}")
+def generate():
+    payload = {
+        "profile_id": PROFILE_ID,
+        "text": TEXT,
+        "language": "en",
+        "seed": 42
+    }
+    
+    print(f"Triggering generation for: '{TEXT}'")
+    response = requests.post(f"{BASE_URL}/generate", json=payload)
+    response.raise_for_status()
+    gen_data = response.json()
+    gen_id = gen_data["id"]
+    print(f"Generation triggered. ID: {gen_id}")
+    return gen_id
 
-        # 2. Create Profile
-        print("Creating Profile...")
-        try:
-            r = await client.post(f"{BASE_URL}/profiles", json={"name": "CloneTest_01", "language": "zh", "description": "Manual Test"})
-            r.raise_for_status()
-            profile_id = r.json()["id"]
-            print(f"Profile ID: {profile_id}")
-        except httpx.HTTPStatusError as e:
-            print(f"Profile Creation Error: {e.response.status_code}")
-            print(f"Detail: {e.response.text}")
-            return
+def poll_and_download(gen_id):
+    print(f"Polling status for ID: {gen_id}...")
+    while True:
+        response = requests.get(f"{BASE_URL}/history/{gen_id}")
+        response.raise_for_status()
+        data = response.json()
+        status = data.get("status", "generating")
+        print(f"Status: {status}")
 
-        # 3. Add Sample
-        print("Adding Sample...")
-        try:
-            with open(AUDIO_PATH, "rb") as f:
-                r = await client.post(f"{BASE_URL}/profiles/{profile_id}/samples", files={"file": ("sample.wav", f, "audio/wav")}, data={"reference_text": ref_text})
-                r.raise_for_status()
-            print("Sample Added.")
-        except httpx.HTTPStatusError as e:
-            print(f"Add Sample Error: {e.response.status_code}")
-            print(f"Detail: {e.response.text}")
-            return
-
-        # 4. Generate Speech
-        print("Generating Speech...")
-        gen_text = "這是一個聲音克隆測試，Voicebox 啟動成功！"
-        try:
-            r = await client.post(f"{BASE_URL}/generate", json={
-                "profile_id": profile_id,
-                "text": gen_text,
-                "language": "zh",
-                "engine": "qwen",
-                "model_size": "1.7B"
-            })
-            r.raise_for_status()
-            gen_id = r.json()["id"]
-            print(f"Generation ID: {gen_id}")
-        except httpx.HTTPStatusError as e:
-            print(f"Generation Error: {e.response.status_code}")
-            print(f"Detail: {e.response.text}")
-            return
-
-        # 5. Poll for completion
-        print("Waiting for generation...")
-        for _ in range(60):
-            await asyncio.sleep(5)
-            r = await client.get(f"{BASE_URL}/history/{gen_id}")
-            status = r.json().get("status")
-            if status == "completed":
-                print("Generation Completed.")
-                break
-            elif status == "failed":
-                print("Generation Failed.")
-                return
-        
-        # 6. Download
-        output_path = r"c:\Users\Allen\OneDrive\Desktop\Voicebox\test_output.wav"
-        r = await client.get(f"{BASE_URL}/audio/{gen_id}")
-        with open(output_path, "wb") as f:
-            f.write(r.content)
-        print(f"Output saved to: {output_path}")
+        if status == "failed":
+            error = data.get("error", "Unknown error")
+            raise Exception(f"Generation failed: {error}")
+        # Triple validation: completed + audio_path non-empty + duration>0
+        if (status == "completed"
+                and data.get("duration", 0) > 0
+                and data.get("audio_path", "")):
+            break
+            
+        time.sleep(2)
+    
+    print("Generation complete! Downloading...")
+    download_url = f"{BASE_URL}/history/{gen_id}/export-audio"
+    response = requests.get(download_url)
+    response.raise_for_status()
+    
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    with open(OUTPUT_PATH, "wb") as f:
+        f.write(response.content)
+    print(f"Saved to: {OUTPUT_PATH}")
 
 if __name__ == "__main__":
-    asyncio.run(test_flow())
+    try:
+        gid = generate()
+        poll_and_download(gid)
+    except Exception as e:
+        print(f"ERROR: {e}")

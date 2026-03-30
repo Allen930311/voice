@@ -53,6 +53,50 @@ To use Voicebox in your AI assistant (e.g., Claude), add the server:
 claude mcp add voicebox --command "python c:/Users/Allen/OneDrive/Desktop/Voicebox/voicebox-mcp/server.py"
 ```
 
+如果你之後需要重新開始生成，請執行：
+powershell -File scripts/start-voicebox-gpu.ps1
+
+
+這將會重新啟動後端並載入 GPU 加速引擎
+
+在終端機中，你可以使用以下幾種方式來查看 Voicebox 的目前狀態：
+
+1. 快速健康檢查 (Health Check)
+這是最直接且建議的方式，可以查看後端是否運行中、GPU 是否可用、模型是否已載入等資訊。
+
+PowerShell (推薦):
+
+Invoke-RestMethod -Uri "http://127.0.0.1:17493/health" | ConvertTo-Json
+
+cURL:
+
+bash
+curl http://127.0.0.1:17493/health
+
+2. 查看工作任務與生成歷史 (Task History)
+如果你想知道目前有沒有任務在執行（或者之前的生成是否成功），可以查看歷史紀錄：
+
+PowerShell:
+
+Invoke-RestMethod -Uri "http://127.0.0.1:17493/history?limit=5" | ConvertTo-Json
+
+3. 查看即時日誌 (Real-time Logs)
+如果你想看後端後台到底在跑什麼（例如編譯核心、載入模型進度），可以直接透過此專案配置的 just 指令：
+
+just logs
+或直接手動讀取日誌檔：
+
+Get-Content backend/logs/*.log -Tail 50 -Wait
+4. 查看模型下載/掛載狀態
+確認哪些模型已經準備好，哪些還在下載：
+
+
+Invoke-RestMethod -Uri "http://127.0.0.1:17493/models/status" | ConvertTo-Json
+
+💡 實用小撇步
+後端手動重啟：如果發現狀態卡死（例如 VRAM 溢出），專案內有一個重啟 GPU 模式的指令：
+powershell
+powershell -File scripts/start-voicebox-gpu.ps1
 ---
 
 ## 🛠️ Tech Stack | 技術棧

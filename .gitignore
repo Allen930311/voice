@@ -25,6 +25,8 @@ status_utf8.json
 payload.json
 .DS_Store
 Thumbs.db
+voicebox.db
+temp.json
 .auto-skill-local.md
 voicebox/backend/venv*/
 .venv/

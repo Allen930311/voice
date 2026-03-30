@@ -9,8 +9,7 @@ Voicebox MCP Server — 個人配音室工具
 import asyncio
 import json
 import os
-import sys
-import base64
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +23,10 @@ VOICEBOX_PROJECT = Path(os.getenv(
     r"c:\Users\Allen\OneDrive\Desktop\Voicebox\voicebox"
 ))
 TIMEOUT = httpx.Timeout(300.0, connect=10.0)  # TTS 生成可能很慢
+GPU_LAUNCHER = Path(os.getenv(
+    "VOICEBOX_GPU_LAUNCHER",
+    r"c:\Users\Allen\OneDrive\Desktop\Voicebox\scripts\start-voicebox-gpu.ps1",
+))
 
 mcp = FastMCP(
     "voicebox",
@@ -42,6 +45,51 @@ def _client() -> httpx.AsyncClient:
     return httpx.AsyncClient(base_url=VOICEBOX_BASE_URL, timeout=TIMEOUT)
 
 
+async def _ensure_backend_ready(start_if_down: bool = True) -> tuple[bool, str]:
+    """確認後端運行中。若未啟動且 start_if_down=True，則啟動 GPU 後端並等待就緒。
+
+    Returns:
+        (is_ready, message)
+    """
+    # 1. 先檢查是否已在運行
+    try:
+        async with _client() as c:
+            r = await c.get("/health", timeout=httpx.Timeout(5.0))
+            r.raise_for_status()
+            data = r.json()
+            gpu = data.get("gpu_type", "CPU")
+            return True, f"後端已就緒（{gpu}）"
+    except (httpx.ConnectError, httpx.TimeoutException):
+        pass
+
+    if not start_if_down:
+        return False, "後端未啟動"
+
+    if not GPU_LAUNCHER.exists():
+        return False, f"找不到 GPU 啟動腳本：{GPU_LAUNCHER}"
+
+    # 2. 啟動 GPU 後端
+    subprocess.Popen(
+        ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(GPU_LAUNCHER)],
+        creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
+    )
+
+    # 3. 等待後端就緒（最多 40 秒）
+    for i in range(40):
+        await asyncio.sleep(1)
+        try:
+            async with _client() as c:
+                r = await c.get("/health", timeout=httpx.Timeout(3.0))
+                r.raise_for_status()
+                data = r.json()
+                gpu = data.get("gpu_type", "CPU")
+                return True, f"GPU 後端已啟動並就緒（{gpu}，等待 {i + 1} 秒）"
+        except (httpx.ConnectError, httpx.TimeoutException):
+            continue
+
+    return False, "GPU 後端啟動逾時（40 秒），請手動確認"
+
+
 async def _poll_generation(
     client: httpx.AsyncClient,
     gen_id: str,
@@ -56,10 +104,14 @@ async def _poll_generation(
             r.raise_for_status()
             status_data = r.json()
             s = status_data.get("status", "pending")
-            if s == "completed":
-                break
-            elif s == "failed":
+            if s == "failed":
                 return status_data, None
+            # Triple validation: status=completed AND audio_path non-empty AND duration>0
+            if (s == "completed"
+                    and status_data.get("duration", 0) > 0
+                    and status_data.get("audio_path", "")):
+                break
+            # status=completed but audio not ready yet — keep waiting
         except httpx.HTTPStatusError:
             continue
     else:
@@ -140,6 +192,15 @@ async def voicebox_status() -> str:
         )
     except Exception as e:
         return f"❌ 連線錯誤：{e}"
+
+
+@mcp.tool()
+async def voicebox_start_backend() -> str:
+    """啟動 Voicebox GPU 後端（Intel Arc / DirectML）。若後端已在運行則直接回報狀態。"""
+    ready, msg = await _ensure_backend_ready(start_if_down=True)
+    if ready:
+        return f"✅ {msg}"
+    return f"❌ {msg}\n\n手動啟動：\n  powershell -File {GPU_LAUNCHER}"
 
 
 # ─── 語音 Profile 管理 ───
@@ -341,6 +402,11 @@ async def voicebox_generate(
         instruct: 語音指令（僅 chatterbox_turbo 支援）
         output_path: 可選，指定輸出音訊的儲存路徑（會複製一份）
     """
+    # 0. 確認後端就緒（若未啟動則自動啟動 GPU 後端）
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
     payload = {
         "profile_id": profile_id,
         "text": text,
@@ -362,6 +428,7 @@ async def voicebox_generate(
         gen_id = gen["id"]
 
         # 2. 輪詢等待完成（SSE 在 MCP 中不方便，改用輪詢）
+        status_data: dict = {}
         for _ in range(120):  # 最多等 10 分鐘
             await asyncio.sleep(5)
             try:
@@ -369,11 +436,15 @@ async def voicebox_generate(
                 r2.raise_for_status()
                 status_data = r2.json()
                 status = status_data.get("status", "pending")
-                if status == "completed":
-                    break
-                elif status == "failed":
+                if status == "failed":
                     err = status_data.get("error", "未知錯誤")
                     return f"❌ 生成失敗：{err}"
+                # Triple validation: completed + audio_path non-empty + duration>0
+                if (status == "completed"
+                        and status_data.get("duration", 0) > 0
+                        and status_data.get("audio_path", "")):
+                    break
+                # status=completed but audio not ready — keep waiting
             except httpx.HTTPStatusError:
                 continue
         else:

@@ -90,6 +90,8 @@ async def get_generation(
         duration=gen.duration,
         seed=gen.seed,
         instruct=gen.instruct,
+        status=gen.status or "completed",
+        error=gen.error,
         created_at=gen.created_at,
     )
 
