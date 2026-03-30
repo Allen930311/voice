@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "voicebox": {
+      "command": "python",
+      "args": ["c:\\Users\\Allen\\OneDrive\\Desktop\\Voicebox\\voicebox-mcp\\server.py"],
+      "env": {
+        "VOICEBOX_URL": "http://127.0.0.1:17493",
+        "VOICEBOX_PROJECT": "c:\\Users\\Allen\\OneDrive\\Desktop\\Voicebox\\voicebox",
+        "VOICEBOX_GPU_LAUNCHER": "c:\\Users\\Allen\\OneDrive\\Desktop\\Voicebox\\scripts\\start-voicebox-gpu.ps1"
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 # 專案上下文 (Agent Context)：Voicebox
 
-> **最後更新時間**：2026-03-30 09:35
+> **最後更新時間**：2026-03-30 09:58
 > **自動生成**：由 `prepare_context.py` 產生，供 AI Agent 快速掌握專案全局
 
 ---
@@ -60,6 +60,7 @@ Voicebox/
 │   ├── output_test.wav
 │   ├── shohei_gpu_test.wav
 │   ├── shohei_ohtani_final.wav
+│   ├── test_automation_flow.wav
 │   ├── test_dramatic.wav
 │   ├── yan_cong_en.wav
 │   ├── 今天天氣真好.wav
