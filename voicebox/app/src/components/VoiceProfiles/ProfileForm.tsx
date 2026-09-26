@@ -1,9 +1,12 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { Edit2, Mic, Monitor, Upload, X } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { Edit2, Mic, Monitor, Music, Upload, X } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useForm } from 'react-hook-form';
+import { useTranslation } from 'react-i18next';
 import * as z from 'zod';
 import { EffectsChainEditor } from '@/components/Effects/EffectsChainEditor';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -15,6 +18,7 @@ import {
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -32,7 +36,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { apiClient } from '@/lib/api/client';
-import type { EffectConfig } from '@/lib/api/types';
+import type { EffectConfig, PresetVoice, VoiceType } from '@/lib/api/types';
 import { LANGUAGE_CODES, LANGUAGE_OPTIONS, type LanguageCode } from '@/lib/constants/languages';
 import { useAudioPlayer } from '@/lib/hooks/useAudioPlayer';
 import { useAudioRecording } from '@/lib/hooks/useAudioRecording';
@@ -40,6 +44,7 @@ import {
   useAddSample,
   useCreateProfile,
   useDeleteAvatar,
+  useDeleteProfile,
   useProfile,
   useUpdateProfile,
   useUploadAvatar,
@@ -56,31 +61,51 @@ import { AudioSampleUpload } from './AudioSampleUpload';
 import { SampleList } from './SampleList';
 
 const MAX_AUDIO_DURATION_SECONDS = 30;
+const PRESET_ONLY_ENGINES = new Set(['kokoro', 'qwen_custom_voice']);
+const DEFAULT_ENGINE_OPTIONS = [
+  { value: 'qwen', label: 'Qwen3-TTS' },
+  { value: 'qwen_custom_voice', label: 'Qwen CustomVoice' },
+  { value: 'luxtts', label: 'LuxTTS' },
+  { value: 'chatterbox', label: 'Chatterbox' },
+  { value: 'chatterbox_turbo', label: 'Chatterbox Turbo' },
+  { value: 'tada', label: 'TADA' },
+  { value: 'kokoro', label: 'Kokoro 82M' },
+] as const;
 
-const baseProfileSchema = z.object({
-  name: z.string().min(1, 'Name is required').max(100),
-  description: z.string().max(500).optional(),
-  language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
-  sampleFile: z.instanceof(File).optional(),
-  referenceText: z.string().max(1000).optional(),
-  avatarFile: z.instanceof(File).optional(),
-});
+function makeProfileSchema(t: (key: string) => string) {
+  const baseProfileSchema = z.object({
+    name: z.string().min(1, t('profileForm.validation.nameRequired')).max(100),
+    description: z.string().max(500).optional(),
+    language: z.enum(LANGUAGE_CODES as [LanguageCode, ...LanguageCode[]]),
+    personality: z.string().max(2000).optional(),
+    sampleFile: z.instanceof(File).optional(),
+    referenceText: z.string().max(1000).optional(),
+    avatarFile: z.instanceof(File).optional(),
+  });
 
-const profileSchema = baseProfileSchema.refine(
-  (data) => {
-    // If sample file is provided, reference text is required
-    if (data.sampleFile && (!data.referenceText || data.referenceText.trim().length === 0)) {
-      return false;
-    }
-    return true;
-  },
-  {
-    message: 'Reference text is required when adding a sample',
-    path: ['referenceText'],
-  },
-);
+  return baseProfileSchema.refine(
+    (data) => {
+      if (data.sampleFile && (!data.referenceText || data.referenceText.trim().length === 0)) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: t('profileForm.validation.referenceRequired'),
+      path: ['referenceText'],
+    },
+  );
+}
 
-type ProfileFormValues = z.infer<typeof profileSchema>;
+type ProfileFormValues = {
+  name: string;
+  description?: string;
+  language: LanguageCode;
+  personality?: string;
+  sampleFile?: File;
+  referenceText?: string;
+  avatarFile?: File;
+};
 
 // Helper to convert File to base64
 async function fileToBase64(file: File): Promise<string> {
@@ -105,6 +130,7 @@ function base64ToFile(base64: string, fileName: string, fileType: string): File 
 }
 
 export function ProfileForm() {
+  const { t } = useTranslation();
   const platform = usePlatform();
   const open = useUIStore((state) => state.profileDialogOpen);
   const setOpen = useUIStore((state) => state.setProfileDialogOpen);
@@ -116,27 +142,33 @@ export function ProfileForm() {
   const createProfile = useCreateProfile();
   const updateProfile = useUpdateProfile();
   const addSample = useAddSample();
+  const deleteProfile = useDeleteProfile();
   const uploadAvatar = useUploadAvatar();
   const deleteAvatar = useDeleteAvatar();
   const transcribe = useTranscription();
   const { toast } = useToast();
+  const [voiceSource, setVoiceSource] = useState<'clone' | 'builtin'>('clone');
   const [sampleMode, setSampleMode] = useState<'upload' | 'record' | 'system'>('record');
   const [audioDuration, setAudioDuration] = useState<number | null>(null);
   const [isValidatingAudio, setIsValidatingAudio] = useState(false);
   const [avatarPreview, setAvatarPreview] = useState<string | null>(null);
+  const [selectedPresetEngine, setSelectedPresetEngine] = useState<string>('kokoro');
+  const [selectedPresetVoiceId, setSelectedPresetVoiceId] = useState<string>('');
   const avatarInputRef = useRef<HTMLInputElement>(null);
   const { isPlaying, playPause, cleanup: cleanupAudio } = useAudioPlayer();
   const isCreating = !editingProfileId;
   const serverUrl = useServerStore((state) => state.serverUrl);
   const [profileEffectsChain, setProfileEffectsChain] = useState<EffectConfig[]>([]);
   const [effectsDirty, setEffectsDirty] = useState(false);
+  const [defaultEngine, setDefaultEngine] = useState<string>('');
 
   const form = useForm<ProfileFormValues>({
-    resolver: zodResolver(profileSchema),
+    resolver: zodResolver(makeProfileSchema(t)),
     defaultValues: {
       name: '',
       description: '',
       language: 'en',
+      personality: '',
       sampleFile: undefined,
       referenceText: '',
       avatarFile: undefined,
@@ -156,7 +188,10 @@ export function ProfileForm() {
           if (duration > MAX_AUDIO_DURATION_SECONDS) {
             form.setError('sampleFile', {
               type: 'manual',
-              message: `Audio is too long (${formatAudioDuration(duration)}). Maximum duration is ${formatAudioDuration(MAX_AUDIO_DURATION_SECONDS)}.`,
+              message: t('profileForm.validation.audioTooLong', {
+                duration: formatAudioDuration(duration),
+                max: formatAudioDuration(MAX_AUDIO_DURATION_SECONDS),
+              }),
             });
           } else {
             form.clearErrors('sampleFile');
@@ -165,14 +200,13 @@ export function ProfileForm() {
         .catch((error) => {
           console.error('Failed to get audio duration:', error);
           setAudioDuration(null);
-          // For recordings, we auto-stop at max duration, so we can skip validation errors
           const isRecordedFile =
             selectedFile.name.startsWith('recording-') ||
             selectedFile.name.startsWith('system-audio-');
           if (!isRecordedFile) {
             form.setError('sampleFile', {
               type: 'manual',
-              message: 'Failed to validate audio file. Please try a different file.',
+              message: t('profileForm.validation.audioFailed'),
             });
           } else {
             // Clear any existing errors for recorded files
@@ -186,7 +220,7 @@ export function ProfileForm() {
       setAudioDuration(null);
       form.clearErrors('sampleFile');
     }
-  }, [selectedFile, form]);
+  }, [selectedFile, form, t]);
 
   const {
     isRecording,
@@ -207,8 +241,8 @@ export function ProfileForm() {
       }
       form.setValue('sampleFile', file, { shouldValidate: true });
       toast({
-        title: 'Recording complete',
-        description: 'Audio has been recorded successfully.',
+        title: t('profileForm.toast.recordingComplete'),
+        description: t('profileForm.toast.recordingCompleteDescription'),
       });
     },
   });
@@ -233,33 +267,52 @@ export function ProfileForm() {
       }
       form.setValue('sampleFile', file, { shouldValidate: true });
       toast({
-        title: 'System audio captured',
-        description: 'Audio has been captured successfully.',
+        title: t('profileForm.toast.systemAudioCaptured'),
+        description: t('profileForm.toast.systemAudioCapturedDescription'),
       });
     },
   });
+
+  // Fetch available preset voices for the selected engine
+  const presetEngineToQuery = isCreating
+    ? selectedPresetEngine
+    : (editingProfile?.preset_engine ?? '');
+  const { data: presetVoicesData } = useQuery({
+    queryKey: ['presetVoices', presetEngineToQuery],
+    queryFn: () => apiClient.listPresetVoices(presetEngineToQuery),
+    enabled:
+      !!presetEngineToQuery &&
+      ((voiceSource === 'builtin' && isCreating) ||
+        (!isCreating && editingProfile?.voice_type === 'preset')),
+  });
+  const presetVoices = presetVoicesData?.voices ?? [];
+  const isSampleBasedProfile = isCreating
+    ? voiceSource === 'clone'
+    : editingProfile?.voice_type !== 'preset';
+  const availableDefaultEngines = DEFAULT_ENGINE_OPTIONS.filter(
+    (option) => !isSampleBasedProfile || !PRESET_ONLY_ENGINES.has(option.value),
+  );
 
   // Show recording errors
   useEffect(() => {
     if (recordingError) {
       toast({
-        title: 'Recording error',
+        title: t('profileForm.toast.recordingError'),
         description: recordingError,
         variant: 'destructive',
       });
     }
-  }, [recordingError, toast]);
+  }, [recordingError, toast, t]);
 
-  // Show system audio recording errors
   useEffect(() => {
     if (systemRecordingError) {
       toast({
-        title: 'System audio capture error',
+        title: t('profileForm.toast.systemAudioError'),
         description: systemRecordingError,
         variant: 'destructive',
       });
     }
-  }, [systemRecordingError, toast]);
+  }, [systemRecordingError, toast, t]);
 
   // Handle avatar preview
   useEffect(() => {
@@ -281,18 +334,21 @@ export function ProfileForm() {
         name: editingProfile.name,
         description: editingProfile.description || '',
         language: editingProfile.language as LanguageCode,
+        personality: editingProfile.personality || '',
         sampleFile: undefined,
         referenceText: undefined,
         avatarFile: undefined,
       });
       setProfileEffectsChain(editingProfile.effects_chain ?? []);
       setEffectsDirty(false);
+      setDefaultEngine(editingProfile.default_engine ?? '');
     } else if (profileFormDraft && open) {
       // Restore from draft when opening in create mode
       form.reset({
         name: profileFormDraft.name,
         description: profileFormDraft.description,
         language: profileFormDraft.language as LanguageCode,
+        personality: profileFormDraft.personality || '',
         referenceText: profileFormDraft.referenceText,
         sampleFile: undefined,
         avatarFile: undefined,
@@ -317,6 +373,7 @@ export function ProfileForm() {
         name: '',
         description: '',
         language: 'en',
+        personality: '',
         sampleFile: undefined,
         referenceText: undefined,
         avatarFile: undefined,
@@ -326,12 +383,30 @@ export function ProfileForm() {
     }
   }, [editingProfile, profileFormDraft, open, form]);
 
+  useEffect(() => {
+    if (
+      defaultEngine &&
+      !availableDefaultEngines.some((option) => option.value === defaultEngine)
+    ) {
+      setDefaultEngine('');
+    }
+  }, [availableDefaultEngines, defaultEngine]);
+
+  useEffect(() => {
+    if (!selectedPresetVoiceId) {
+      return;
+    }
+
+    if (!presetVoices.some((voice: PresetVoice) => voice.voice_id === selectedPresetVoiceId)) {
+      setSelectedPresetVoiceId('');
+    }
+  }, [presetVoices, selectedPresetVoiceId]);
   async function handleTranscribe() {
     const file = form.getValues('sampleFile');
     if (!file) {
       toast({
-        title: 'No file selected',
-        description: 'Please select an audio file first.',
+        title: t('profileForm.toast.noFile'),
+        description: t('profileForm.toast.noFileDescription'),
         variant: 'destructive',
       });
       return;
@@ -344,8 +419,9 @@ export function ProfileForm() {
       form.setValue('referenceText', result.text, { shouldValidate: true });
     } catch (error) {
       toast({
-        title: 'Transcription failed',
-        description: error instanceof Error ? error.message : 'Failed to transcribe audio',
+        title: t('profileForm.toast.transcribeFailed'),
+        description:
+          error instanceof Error ? error.message : t('profileForm.toast.transcribeFailedFallback'),
         variant: 'destructive',
       });
     }
@@ -371,16 +447,16 @@ export function ProfileForm() {
     if (file) {
       if (!file.type.startsWith('image/')) {
         toast({
-          title: 'Invalid file type',
-          description: 'Please select an image file (PNG, JPG, or WebP)',
+          title: t('profileForm.toast.invalidFile'),
+          description: t('profileForm.toast.invalidImageFormat'),
           variant: 'destructive',
         });
         return;
       }
       if (file.size > 5 * 1024 * 1024) {
         toast({
-          title: 'File too large',
-          description: 'Image must be less than 5MB',
+          title: t('profileForm.toast.fileTooLarge'),
+          description: t('profileForm.toast.imageTooLargeDescription'),
           variant: 'destructive',
         });
         return;
@@ -394,13 +470,13 @@ export function ProfileForm() {
       try {
         await deleteAvatar.mutateAsync(editingProfileId);
         toast({
-          title: 'Avatar removed',
-          description: 'Avatar image has been removed successfully.',
+          title: t('profileForm.toast.avatarRemoved'),
+          description: t('profileForm.toast.avatarRemovedDescription'),
         });
       } catch (error) {
         toast({
-          title: 'Failed to remove avatar',
-          description: error instanceof Error ? error.message : 'Unknown error',
+          title: t('profileForm.toast.avatarRemoveFailed'),
+          description: error instanceof Error ? error.message : t('common.unknownError'),
           variant: 'destructive',
         });
       }
@@ -415,13 +491,15 @@ export function ProfileForm() {
   async function onSubmit(data: ProfileFormValues) {
     try {
       if (editingProfileId) {
-        // Editing: just update profile
+        // Editing: update profile
         await updateProfile.mutateAsync({
           profileId: editingProfileId,
           data: {
             name: data.name,
             description: data.description,
             language: data.language,
+            default_engine: defaultEngine || undefined,
+            personality: data.personality?.trim() ? data.personality.trim() : undefined,
           },
         });
 
@@ -434,9 +512,11 @@ export function ProfileForm() {
             });
           } catch (avatarError) {
             toast({
-              title: 'Avatar upload failed',
+              title: t('profileForm.toast.avatarUploadFailed'),
               description:
-                avatarError instanceof Error ? avatarError.message : 'Failed to upload avatar',
+                avatarError instanceof Error
+                  ? avatarError.message
+                  : t('profileForm.toast.avatarUploadFailedFallback'),
               variant: 'destructive',
             });
           }
@@ -451,9 +531,11 @@ export function ProfileForm() {
             );
           } catch (fxError) {
             toast({
-              title: 'Effects update failed',
+              title: t('profileForm.toast.effectsUpdateFailed'),
               description:
-                fxError instanceof Error ? fxError.message : 'Failed to save effects chain',
+                fxError instanceof Error
+                  ? fxError.message
+                  : t('profileForm.toast.effectsUpdateFailedFallback'),
               variant: 'destructive',
             });
             return;
@@ -461,22 +543,67 @@ export function ProfileForm() {
         }
 
         toast({
-          title: 'Voice updated',
-          description: `"${data.name}" has been updated successfully.`,
+          title: t('profileForm.toast.voiceUpdated'),
+          description: t('profileForm.toast.voiceUpdatedDescription', { name: data.name }),
+        });
+      } else if (voiceSource === 'builtin') {
+        // Creating preset profile from built-in voice
+        if (!selectedPresetVoiceId) {
+          toast({
+            title: t('profileForm.toast.noVoiceSelected'),
+            description: t('profileForm.toast.noVoiceSelectedDescription'),
+            variant: 'destructive',
+          });
+          return;
+        }
+
+        const profile = await createProfile.mutateAsync({
+          name: data.name,
+          description: data.description,
+          language: data.language,
+          voice_type: 'preset' as VoiceType,
+          preset_engine: selectedPresetEngine,
+          preset_voice_id: selectedPresetVoiceId,
+          default_engine: selectedPresetEngine,
+          personality: data.personality?.trim() ? data.personality.trim() : undefined,
+        });
+
+        // Handle avatar upload if provided
+        if (data.avatarFile) {
+          try {
+            await uploadAvatar.mutateAsync({
+              profileId: profile.id,
+              file: data.avatarFile,
+            });
+          } catch (avatarError) {
+            toast({
+              title: t('profileForm.toast.avatarUploadFailed'),
+              description:
+                avatarError instanceof Error
+                  ? avatarError.message
+                  : t('profileForm.toast.avatarUploadFailedFallback'),
+              variant: 'destructive',
+            });
+          }
+        }
+
+        toast({
+          title: t('profileForm.toast.profileCreated'),
+          description: t('profileForm.toast.profileCreatedBuiltin', { name: data.name }),
         });
       } else {
-        // Creating: require sample file and reference text
+        // Creating cloned profile: require sample file and reference text
         const sampleFile = form.getValues('sampleFile');
         const referenceText = form.getValues('referenceText');
 
         if (!sampleFile) {
           form.setError('sampleFile', {
             type: 'manual',
-            message: 'Audio sample is required',
+            message: t('profileForm.validation.sampleRequired'),
           });
           toast({
-            title: 'Audio sample required',
-            description: 'Please provide an audio sample to create the voice profile.',
+            title: t('profileForm.toast.sampleRequired'),
+            description: t('profileForm.toast.sampleRequiredDescription'),
             variant: 'destructive',
           });
           return;
@@ -485,42 +612,48 @@ export function ProfileForm() {
         if (!referenceText || referenceText.trim().length === 0) {
           form.setError('referenceText', {
             type: 'manual',
-            message: 'Reference text is required',
+            message: t('profileForm.validation.referenceTextRequired'),
           });
           toast({
-            title: 'Reference text required',
-            description: 'Please provide the reference text for the audio sample.',
+            title: t('profileForm.toast.referenceTextRequired'),
+            description: t('profileForm.toast.referenceTextRequiredDescription'),
             variant: 'destructive',
           });
           return;
         }
 
-        // Validate audio duration before creating profile
         try {
           const duration = await getAudioDuration(sampleFile);
           if (duration > MAX_AUDIO_DURATION_SECONDS) {
             form.setError('sampleFile', {
               type: 'manual',
-              message: `Audio is too long (${formatAudioDuration(duration)}). Maximum duration is ${formatAudioDuration(MAX_AUDIO_DURATION_SECONDS)}.`,
+              message: t('profileForm.validation.audioTooLong', {
+                duration: formatAudioDuration(duration),
+                max: formatAudioDuration(MAX_AUDIO_DURATION_SECONDS),
+              }),
             });
             toast({
-              title: 'Invalid audio file',
-              description: `Audio duration is ${formatAudioDuration(duration)}, but maximum is ${formatAudioDuration(MAX_AUDIO_DURATION_SECONDS)}.`,
+              title: t('profileForm.toast.invalidAudio'),
+              description: t('profileForm.toast.invalidAudioDescription', {
+                duration: formatAudioDuration(duration),
+                max: formatAudioDuration(MAX_AUDIO_DURATION_SECONDS),
+              }),
               variant: 'destructive',
             });
-            return; // Prevent form submission
+            return;
           }
         } catch (error) {
           form.setError('sampleFile', {
             type: 'manual',
-            message: 'Failed to validate audio file. Please try a different file.',
+            message: t('profileForm.validation.audioFailed'),
           });
           toast({
-            title: 'Validation error',
-            description: error instanceof Error ? error.message : 'Failed to validate audio file',
+            title: t('profileForm.toast.validationError'),
+            description:
+              error instanceof Error ? error.message : t('profileForm.validation.audioFailed'),
             variant: 'destructive',
           });
-          return; // Prevent form submission
+          return;
         }
 
         // Creating: create profile, then add sample
@@ -528,6 +661,8 @@ export function ProfileForm() {
           name: data.name,
           description: data.description,
           language: data.language,
+          default_engine: defaultEngine || undefined,
+          personality: data.personality?.trim() ? data.personality.trim() : undefined,
         });
 
         // Convert non-WAV uploads to WAV so the backend can always use soundfile.
@@ -568,16 +703,39 @@ export function ProfileForm() {
           }
 
           toast({
-            title: 'Profile created',
-            description: `"${data.name}" has been created with a sample.`,
+            title: t('profileForm.toast.profileCreated'),
+            description: t('profileForm.toast.profileCreatedSample', { name: data.name }),
           });
         } catch (sampleError) {
-          // Profile was created but sample failed - still show error
+          let rollbackSucceeded = false;
+          try {
+            await deleteProfile.mutateAsync(profile.id);
+            rollbackSucceeded = true;
+          } catch (rollbackError) {
+            toast({
+              title: t('profileForm.toast.rollbackFailed'),
+              description:
+                rollbackError instanceof Error
+                  ? rollbackError.message
+                  : t('profileForm.toast.rollbackFailedDescription'),
+              variant: 'destructive',
+            });
+          }
+
+          const rollbackSuffix = rollbackSucceeded
+            ? ` ${t('profileForm.toast.profileRolledBack')}`
+            : '';
           toast({
-            title: 'Failed to add sample',
-            description: `Profile "${data.name}" was created, but failed to add sample: ${sampleError instanceof Error ? sampleError.message : 'Unknown error'}`,
+            title: t('profileForm.toast.sampleFailed'),
+            description:
+              sampleError instanceof Error
+                ? `${sampleError.message}${rollbackSuffix}`
+                : rollbackSucceeded
+                  ? t('profileForm.toast.sampleFailedRolledBack')
+                  : t('profileForm.toast.sampleFailedDescription'),
             variant: 'destructive',
           });
+          return;
         }
       }
 
@@ -588,8 +746,8 @@ export function ProfileForm() {
       setOpen(false);
     } catch (error) {
       toast({
-        title: 'Error',
-        description: error instanceof Error ? error.message : 'Failed to save profile',
+        title: t('common.error'),
+        description: error instanceof Error ? error.message : t('profileForm.toast.saveFailed'),
         variant: 'destructive',
       });
     }
@@ -607,6 +765,7 @@ export function ProfileForm() {
           name: values.name || '',
           description: values.description || '',
           language: values.language || 'en',
+          personality: values.personality || '',
           referenceText: values.referenceText || '',
           sampleMode,
         };
@@ -642,20 +801,22 @@ export function ProfileForm() {
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="max-w-none w-screen h-screen left-0 top-0 translate-x-0 translate-y-0 rounded-none p-6 overflow-y-auto">
-        <div className="max-w-5xl max-h-[85vh] mx-auto my-auto w-full flex flex-col">
+      <DialogContent className="max-w-none w-screen h-screen left-0 top-0 translate-x-0 translate-y-0 rounded-none p-6 overflow-hidden">
+        <div className="max-w-5xl h-[85vh] mx-auto my-auto w-full flex flex-col overflow-hidden">
           <DialogHeader>
             <DialogTitle className="text-2xl">
-              {editingProfileId ? 'Edit Voice' : 'Clone voice'}
+              {editingProfileId ? t('profileForm.editTitle') : t('profileForm.createTitle')}
             </DialogTitle>
             <DialogDescription>
               {editingProfileId
-                ? 'Update your voice profile details and manage samples.'
-                : 'Create a new voice profile with an audio sample to clone the voice.'}
+                ? t('profileForm.editDescription')
+                : t('profileForm.createDescription')}
             </DialogDescription>
             {isCreating && profileFormDraft && (
               <div className="flex items-center gap-2 pt-2">
-                <span className="text-xs text-muted-foreground">Draft restored</span>
+                <span className="text-xs text-muted-foreground">
+                  {t('profileForm.draftRestored')}
+                </span>
                 <Button
                   type="button"
                   variant="ghost"
@@ -667,14 +828,16 @@ export function ProfileForm() {
                       name: '',
                       description: '',
                       language: 'en',
+                      personality: '',
                       sampleFile: undefined,
                       referenceText: '',
+                      avatarFile: undefined,
                     });
                     setSampleMode('record');
                   }}
                 >
                   <X className="h-3 w-3 mr-1" />
-                  Discard
+                  {t('profileForm.discard')}
                 </Button>
               </div>
             )}
@@ -682,143 +845,272 @@ export function ProfileForm() {
 
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="flex-1 min-h-0 flex flex-col">
-              <div className="grid gap-6 grid-cols-2 flex-1 overflow-y-auto min-h-0">
+              <div className="grid gap-6 grid-cols-2 flex-1 min-h-0 overflow-hidden">
                 {/* Left column: Sample management */}
-                <div className="space-y-4 border-r pr-6">
+                <div className="space-y-4 border-r pr-6 overflow-y-auto min-h-0">
                   {isCreating ? (
                     <>
-                      <Tabs
-                        className="pt-4"
-                        value={sampleMode}
-                        onValueChange={(v) => {
-                          const newMode = v as 'upload' | 'record' | 'system';
-                          // Cancel any active recordings when switching modes
-                          if (isRecording && newMode !== 'record') {
-                            cancelRecording();
-                          }
-                          if (isSystemRecording && newMode !== 'system') {
-                            cancelSystemRecording();
-                          }
-                          setSampleMode(newMode);
-                        }}
-                      >
-                        <TabsList
-                          className={`grid w-full ${platform.metadata.isTauri && isSystemAudioSupported ? 'grid-cols-3' : 'grid-cols-2'}`}
-                        >
-                          <TabsTrigger value="upload" className="flex items-center gap-2">
-                            <Upload className="h-4 w-4 shrink-0" />
-                            Upload
-                          </TabsTrigger>
-                          <TabsTrigger value="record" className="flex items-center gap-2">
-                            <Mic className="h-4 w-4 shrink-0" />
-                            Record
-                          </TabsTrigger>
-                          {platform.metadata.isTauri && isSystemAudioSupported && (
-                            <TabsTrigger value="system" className="flex items-center gap-2">
-                              <Monitor className="h-4 w-4 shrink-0" />
-                              System Audio
-                            </TabsTrigger>
-                          )}
-                        </TabsList>
+                      {/* Voice source selector */}
+                      <div className="flex pt-4 pb-2">
+                        <div className="inline-flex rounded-lg border border-border p-0.5 bg-muted/50">
+                          <button
+                            type="button"
+                            onClick={() => setVoiceSource('clone')}
+                            className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors ${
+                              voiceSource === 'clone'
+                                ? 'bg-accent text-accent-foreground shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                          >
+                            <Mic className="h-3.5 w-3.5" />
+                            {t('profileForm.source.clone')}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setVoiceSource('builtin')}
+                            className={`inline-flex items-center gap-2 px-3 py-1.5 text-sm rounded-md transition-colors ${
+                              voiceSource === 'builtin'
+                                ? 'bg-accent text-accent-foreground shadow-sm'
+                                : 'text-muted-foreground hover:text-foreground'
+                            }`}
+                          >
+                            <Music className="h-3.5 w-3.5" />
+                            {t('profileForm.source.builtin')}
+                          </button>
+                        </div>
+                      </div>
 
-                        <TabsContent value="upload" className="space-y-4">
-                          <FormField
-                            control={form.control}
-                            name="sampleFile"
-                            render={({ field: { onChange, name } }) => (
-                              <AudioSampleUpload
-                                file={selectedFile}
-                                onFileChange={onChange}
-                                onTranscribe={handleTranscribe}
-                                onPlayPause={handlePlayPause}
-                                isPlaying={isPlaying}
-                                isValidating={isValidatingAudio}
-                                isTranscribing={transcribe.isPending}
-                                isDisabled={
-                                  audioDuration !== null &&
-                                  audioDuration > MAX_AUDIO_DURATION_SECONDS
-                                }
-                                fieldName={name}
-                              />
-                            )}
-                          />
-                        </TabsContent>
+                      {voiceSource === 'builtin' ? (
+                        <div className="space-y-4">
+                          <FormDescription>{t('profileForm.builtin.hint')}</FormDescription>
 
-                        <TabsContent value="record" className="space-y-4">
-                          <FormField
-                            control={form.control}
-                            name="sampleFile"
-                            render={() => (
-                              <AudioSampleRecording
-                                file={selectedFile}
-                                isRecording={isRecording}
-                                duration={duration}
-                                onStart={startRecording}
-                                onStop={stopRecording}
-                                onCancel={handleCancelRecording}
-                                onTranscribe={handleTranscribe}
-                                onPlayPause={handlePlayPause}
-                                isPlaying={isPlaying}
-                                isTranscribing={transcribe.isPending}
-                              />
-                            )}
-                          />
-                        </TabsContent>
-
-                        {platform.metadata.isTauri && isSystemAudioSupported && (
-                          <TabsContent value="system" className="space-y-4">
-                            <FormField
-                              control={form.control}
-                              name="sampleFile"
-                              render={() => (
-                                <AudioSampleSystem
-                                  file={selectedFile}
-                                  isRecording={isSystemRecording}
-                                  duration={systemDuration}
-                                  onStart={startSystemRecording}
-                                  onStop={stopSystemRecording}
-                                  onCancel={handleCancelRecording}
-                                  onTranscribe={handleTranscribe}
-                                  onPlayPause={handlePlayPause}
-                                  isPlaying={isPlaying}
-                                  isTranscribing={transcribe.isPending}
-                                />
-                              )}
-                            />
-                          </TabsContent>
-                        )}
-                      </Tabs>
-
-                      <FormField
-                        control={form.control}
-                        name="referenceText"
-                        render={({ field }) => (
                           <FormItem>
-                            <FormLabel>Reference Text</FormLabel>
-                            <FormControl>
-                              <Textarea
-                                placeholder="Enter the exact text spoken in the audio..."
-                                className="min-h-[100px]"
-                                {...field}
-                              />
-                            </FormControl>
-                            <FormMessage />
+                            <FormLabel>{t('profileForm.fields.engine')}</FormLabel>
+                            <Select
+                              value={selectedPresetEngine}
+                              onValueChange={setSelectedPresetEngine}
+                            >
+                              <FormControl>
+                                <SelectTrigger>
+                                  <SelectValue />
+                                </SelectTrigger>
+                              </FormControl>
+                              <SelectContent>
+                                <SelectItem value="kokoro">Kokoro 82M</SelectItem>
+                                <SelectItem value="qwen_custom_voice">Qwen CustomVoice</SelectItem>
+                              </SelectContent>
+                            </Select>
                           </FormItem>
-                        )}
-                      />
+
+                          {/* Voice picker */}
+                          <FormItem>
+                            <FormLabel>{t('profileForm.fields.voice')}</FormLabel>
+                            <div className="grid grid-cols-2 gap-1.5 max-h-[340px] overflow-y-auto pr-1">
+                              {presetVoices.map((voice: PresetVoice) => (
+                                <button
+                                  key={voice.voice_id}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedPresetVoiceId(voice.voice_id);
+                                    // Auto-set language from voice
+                                    if (voice.language) {
+                                      form.setValue('language', voice.language as LanguageCode);
+                                    }
+                                  }}
+                                  className={`text-left px-3 py-2 rounded-md border text-sm transition-colors ${
+                                    selectedPresetVoiceId === voice.voice_id
+                                      ? 'border-accent bg-accent/10 text-accent-foreground'
+                                      : 'border-border hover:bg-muted'
+                                  }`}
+                                >
+                                  <div className="font-medium">{voice.name}</div>
+                                  <div className="flex gap-1.5 mt-0.5">
+                                    <Badge variant="outline" className="text-[10px] h-4 px-1">
+                                      {voice.gender}
+                                    </Badge>
+                                    <Badge variant="outline" className="text-[10px] h-4 px-1">
+                                      {voice.language}
+                                    </Badge>
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          </FormItem>
+                        </div>
+                      ) : (
+                        <>
+                          <Tabs
+                            className="pt-0"
+                            value={sampleMode}
+                            onValueChange={(v) => {
+                              const newMode = v as 'upload' | 'record' | 'system';
+                              // Cancel any active recordings when switching modes
+                              if (isRecording && newMode !== 'record') {
+                                cancelRecording();
+                              }
+                              if (isSystemRecording && newMode !== 'system') {
+                                cancelSystemRecording();
+                              }
+                              setSampleMode(newMode);
+                            }}
+                          >
+                            <TabsList
+                              className={`grid w-full ${platform.metadata.isTauri && isSystemAudioSupported ? 'grid-cols-3' : 'grid-cols-2'}`}
+                            >
+                              <TabsTrigger value="upload" className="flex items-center gap-2">
+                                <Upload className="h-4 w-4 shrink-0" />
+                                {t('profileForm.sampleTabs.upload')}
+                              </TabsTrigger>
+                              <TabsTrigger value="record" className="flex items-center gap-2">
+                                <Mic className="h-4 w-4 shrink-0" />
+                                {t('profileForm.sampleTabs.record')}
+                              </TabsTrigger>
+                              {platform.metadata.isTauri && isSystemAudioSupported && (
+                                <TabsTrigger value="system" className="flex items-center gap-2">
+                                  <Monitor className="h-4 w-4 shrink-0" />
+                                  {t('profileForm.sampleTabs.system')}
+                                </TabsTrigger>
+                              )}
+                            </TabsList>
+
+                            <TabsContent value="upload" className="space-y-4">
+                              <FormField
+                                control={form.control}
+                                name="sampleFile"
+                                render={({ field: { onChange, name } }) => (
+                                  <AudioSampleUpload
+                                    file={selectedFile}
+                                    onFileChange={onChange}
+                                    onTranscribe={handleTranscribe}
+                                    onPlayPause={handlePlayPause}
+                                    isPlaying={isPlaying}
+                                    isValidating={isValidatingAudio}
+                                    isTranscribing={transcribe.isPending}
+                                    isDisabled={
+                                      audioDuration !== null &&
+                                      audioDuration > MAX_AUDIO_DURATION_SECONDS
+                                    }
+                                    fieldName={name}
+                                  />
+                                )}
+                              />
+                            </TabsContent>
+
+                            <TabsContent value="record" className="space-y-4">
+                              <FormField
+                                control={form.control}
+                                name="sampleFile"
+                                render={() => (
+                                  <AudioSampleRecording
+                                    file={selectedFile}
+                                    isRecording={isRecording}
+                                    duration={duration}
+                                    onStart={startRecording}
+                                    onStop={stopRecording}
+                                    onCancel={handleCancelRecording}
+                                    onTranscribe={handleTranscribe}
+                                    onPlayPause={handlePlayPause}
+                                    isPlaying={isPlaying}
+                                    isTranscribing={transcribe.isPending}
+                                  />
+                                )}
+                              />
+                            </TabsContent>
+
+                            {platform.metadata.isTauri && isSystemAudioSupported && (
+                              <TabsContent value="system" className="space-y-4">
+                                <FormField
+                                  control={form.control}
+                                  name="sampleFile"
+                                  render={() => (
+                                    <AudioSampleSystem
+                                      file={selectedFile}
+                                      isRecording={isSystemRecording}
+                                      duration={systemDuration}
+                                      onStart={startSystemRecording}
+                                      onStop={stopSystemRecording}
+                                      onCancel={handleCancelRecording}
+                                      onTranscribe={handleTranscribe}
+                                      onPlayPause={handlePlayPause}
+                                      isPlaying={isPlaying}
+                                      isTranscribing={transcribe.isPending}
+                                    />
+                                  )}
+                                />
+                              </TabsContent>
+                            )}
+                          </Tabs>
+
+                          <FormField
+                            control={form.control}
+                            name="referenceText"
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel>{t('profileForm.fields.referenceText')}</FormLabel>
+                                <FormControl>
+                                  <Textarea
+                                    placeholder={t('profileForm.fields.referenceTextPlaceholder')}
+                                    className="min-h-[100px]"
+                                    {...field}
+                                  />
+                                </FormControl>
+                                <FormMessage />
+                              </FormItem>
+                            )}
+                          />
+                        </>
+                      )}
                     </>
                   ) : (
-                    // Show sample list when editing
-                    editingProfileId && (
+                    // Editing mode
+                    editingProfileId &&
+                    editingProfile &&
+                    (editingProfile.voice_type === 'preset' ? (
+                      <div className="space-y-4 pt-4">
+                        <div className="rounded-lg border border-border p-4 space-y-3">
+                          <div className="text-sm font-medium text-muted-foreground">
+                            {t('profileForm.builtin.badge')}
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <div className="text-lg font-semibold">
+                              {presetVoices.find(
+                                (v: PresetVoice) => v.voice_id === editingProfile.preset_voice_id,
+                              )?.name ?? editingProfile.preset_voice_id}
+                            </div>
+                            <Badge variant="secondary" className="text-xs">
+                              {editingProfile.preset_engine}
+                            </Badge>
+                          </div>
+                          {(() => {
+                            const voice = presetVoices.find(
+                              (v: PresetVoice) => v.voice_id === editingProfile.preset_voice_id,
+                            );
+                            return voice ? (
+                              <div className="flex gap-1.5">
+                                <Badge variant="outline" className="text-xs">
+                                  {voice.gender}
+                                </Badge>
+                                <Badge variant="outline" className="text-xs">
+                                  {voice.language}
+                                </Badge>
+                              </div>
+                            ) : null;
+                          })()}
+                        </div>
+                        <p className="text-xs text-muted-foreground">
+                          {t('profileForm.builtin.note')}
+                        </p>
+                      </div>
+                    ) : (
                       <div>
                         <SampleList profileId={editingProfileId} />
                       </div>
-                    )
+                    ))
                   )}
                 </div>
 
                 {/* Right column: Profile info */}
-                <div className="space-y-4">
+                <div className="space-y-4 overflow-y-auto min-h-0">
                   {/* Avatar Upload */}
                   <FormField
                     control={form.control}
@@ -832,7 +1124,7 @@ export function ProfileForm() {
                                 {avatarPreview ? (
                                   <img
                                     src={avatarPreview}
-                                    alt="Avatar preview"
+                                    alt={t('profileForm.avatar.alt')}
                                     className="h-full w-full object-cover"
                                   />
                                 ) : (
@@ -876,9 +1168,9 @@ export function ProfileForm() {
                     name="name"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Name</FormLabel>
+                        <FormLabel>{t('profileForm.fields.name')}</FormLabel>
                         <FormControl>
-                          <Input placeholder="My Voice" {...field} />
+                          <Input placeholder={t('profileForm.fields.namePlaceholder')} {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -890,10 +1182,34 @@ export function ProfileForm() {
                     name="description"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Description (Optional)</FormLabel>
+                        <FormLabel>{t('profileForm.fields.descriptionLabel')}</FormLabel>
                         <FormControl>
-                          <Textarea placeholder="Describe this voice..." {...field} />
+                          <Textarea
+                            placeholder={t('profileForm.fields.descriptionPlaceholder')}
+                            {...field}
+                          />
                         </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="personality"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>{t('profileForm.fields.personalityLabel')}</FormLabel>
+                        <FormControl>
+                          <Textarea
+                            placeholder={t('profileForm.fields.personalityPlaceholder')}
+                            className="min-h-[96px]"
+                            {...field}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          {t('profileForm.fields.personalityHint')}
+                        </FormDescription>
                         <FormMessage />
                       </FormItem>
                     )}
@@ -904,7 +1220,7 @@ export function ProfileForm() {
                     name="language"
                     render={({ field }) => (
                       <FormItem>
-                        <FormLabel>Language</FormLabel>
+                        <FormLabel>{t('profileForm.fields.language')}</FormLabel>
                         <Select onValueChange={field.onChange} defaultValue={field.value}>
                           <FormControl>
                             <SelectTrigger>
@@ -924,11 +1240,43 @@ export function ProfileForm() {
                     )}
                   />
 
+                  <FormItem>
+                    <FormLabel>{t('profileForm.fields.defaultEngine')}</FormLabel>
+                    <Select
+                      value={defaultEngine || '_none'}
+                      onValueChange={(v) => {
+                        setDefaultEngine(v === '_none' ? '' : v);
+                      }}
+                      disabled={
+                        voiceSource === 'builtin' || editingProfile?.voice_type === 'preset'
+                      }
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue placeholder={t('profileForm.fields.noPreference')} />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="_none">
+                          {t('profileForm.fields.noPreference')}
+                        </SelectItem>
+                        {availableDefaultEngines.map((option) => (
+                          <SelectItem key={option.value} value={option.value}>
+                            {option.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      {t('profileForm.fields.defaultEngineHint')}
+                    </p>
+                  </FormItem>
+
                   {editingProfileId && (
                     <div className="space-y-2">
-                      <FormLabel>Default Effects</FormLabel>
+                      <FormLabel>{t('profileForm.fields.defaultEffects')}</FormLabel>
                       <p className="text-xs text-muted-foreground">
-                        Effects applied automatically to all new generations with this voice.
+                        {t('profileForm.fields.defaultEffectsHint')}
                       </p>
                       <EffectsChainEditor
                         value={profileEffectsChain}
@@ -945,7 +1293,7 @@ export function ProfileForm() {
 
               <div className="flex gap-2 justify-end mt-6 pt-4 border-t">
                 <Button type="button" variant="outline" onClick={() => handleOpenChange(false)}>
-                  Cancel
+                  {t('common.cancel')}
                 </Button>
                 <Button
                   type="submit"
@@ -954,10 +1302,10 @@ export function ProfileForm() {
                   }
                 >
                   {createProfile.isPending || updateProfile.isPending || addSample.isPending
-                    ? 'Saving...'
+                    ? t('profileForm.actions.saving')
                     : editingProfileId
-                      ? 'Save Changes'
-                      : 'Create Profile'}
+                      ? t('profileForm.actions.saveChanges')
+                      : t('profileForm.actions.createProfile')}
                 </Button>
               </div>
             </form>

@@ -126,6 +126,75 @@ def get_torch_device(
     return "cpu"
 
 
+def check_cuda_compatibility() -> tuple[bool, str | None]:
+    """Check if the installed PyTorch supports the current GPU's compute capability.
+
+    Returns:
+        (compatible, warning_message) — compatible is True if OK or no CUDA GPU,
+        warning_message is a human-readable string if there's a problem.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return True, None
+
+    major, minor = torch.cuda.get_device_capability(0)
+    capability = f"{major}.{minor}"
+    device_name = torch.cuda.get_device_name(0)
+    sm_tag = f"sm_{major}{minor}"
+
+    # torch.cuda._get_arch_list() returns the SM architectures this build
+    # was compiled for (e.g. ["sm_50", "sm_60", ..., "sm_90"]).
+    try:
+        arch_list = torch.cuda._get_arch_list()
+        if arch_list:
+            # Check for both sm_XX and compute_XX (JIT-compiled) entries
+            compute_tag = f"compute_{major}{minor}"
+            if sm_tag not in arch_list and compute_tag not in arch_list:
+                return False, (
+                    f"{device_name} (compute capability {capability} / {sm_tag}) "
+                    f"is not supported by this PyTorch build. "
+                    f"Supported architectures: {', '.join(arch_list)}. "
+                    f"Install PyTorch nightly (cu128) for newer GPU support: "
+                    f"pip install torch --index-url https://download.pytorch.org/whl/nightly/cu128"
+                )
+    except AttributeError:
+        pass
+
+    return True, None
+
+
+def empty_device_cache(device: str) -> None:
+    """
+    Free cached memory on the given device (CUDA or XPU).
+
+    Backends should call this after unloading models so VRAM is returned
+    to the OS.
+    """
+    import torch
+
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.empty_cache()
+
+
+def manual_seed(seed: int, device: str) -> None:
+    """
+    Set the random seed on both CPU and the active accelerator.
+
+    Covers CUDA and Intel XPU so that generation is reproducible
+    regardless of which GPU backend is in use.
+    """
+    import torch
+
+    torch.manual_seed(seed)
+    if device == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    elif device == "xpu" and hasattr(torch, "xpu"):
+        torch.xpu.manual_seed(seed)
+
+
 async def combine_voice_prompts(
     audio_paths: List[str],
     reference_texts: List[str],

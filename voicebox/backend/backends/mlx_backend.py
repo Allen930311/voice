@@ -6,7 +6,6 @@ from typing import Optional, List, Tuple
 import asyncio
 import logging
 import numpy as np
-import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -45,11 +44,9 @@ class MLXTTSBackend:
         Returns:
             HuggingFace Hub model ID for MLX
         """
-        # MLX model mapping
         mlx_model_map = {
             "1.7B": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
-            # 0.6B not yet converted to MLX format
-            "0.6B": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",  # Fallback to 1.7B
+            "0.6B": "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
         }
 
         if model_size not in mlx_model_map:
@@ -96,32 +93,12 @@ class MLXTTSBackend:
         model_name = f"qwen-tts-{model_size}"
         is_cached = self._is_model_cached(model_size)
 
-        # Force offline mode when cached to avoid network requests
-        original_hf_hub_offline = os.environ.get("HF_HUB_OFFLINE")
-        if is_cached:
-            os.environ["HF_HUB_OFFLINE"] = "1"
-            logger.info("[PATCH] Model %s is cached, forcing HF_HUB_OFFLINE=1 to avoid network requests", model_size)
+        with model_load_progress(model_name, is_cached):
+            from mlx_audio.tts import load
 
-        try:
-            with model_load_progress(model_name, is_cached):
-                from mlx_audio.tts import load
+            logger.info("Loading MLX TTS model %s...", model_size)
 
-                logger.info("Loading MLX TTS model %s...", model_size)
-
-                try:
-                    self.model = load(model_path)
-                except Exception as load_error:
-                    if is_cached and "offline" in str(load_error).lower():
-                        logger.warning("[PATCH] Offline load failed, trying with network: %s", load_error)
-                        os.environ.pop("HF_HUB_OFFLINE", None)
-                        self.model = load(model_path)
-                    else:
-                        raise
-        finally:
-            if original_hf_hub_offline is not None:
-                os.environ["HF_HUB_OFFLINE"] = original_hf_hub_offline
-            else:
-                os.environ.pop("HF_HUB_OFFLINE", None)
+            self.model = load(model_path)
 
         self._current_model_size = model_size
         self.model_size = model_size
@@ -239,10 +216,12 @@ class MLXTTSBackend:
                 logger.warning("Regenerating without voice prompt.")
                 ref_audio = None
 
-            # Check if model supports voice cloning via generate method
-            # MLX API may support ref_audio parameter directly
+            # Inference runs with the process's default HF_HUB_OFFLINE
+            # state. Forcing offline here (previously used to avoid lazy
+            # mlx_audio lookups hanging when the network drops mid-inference,
+            # issue #462) regressed online users because libraries make
+            # legitimate metadata calls during generation.
             try:
-                # Try with voice cloning parameters if supported
                 if ref_audio:
                     # Check if generate accepts ref_audio parameter
                     import inspect
@@ -329,6 +308,7 @@ class MLXSTTBackend:
 
             model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
             logger.info("Loading MLX Whisper model %s...", model_size)
+
             self.model = load(model_name)
 
         self.model_size = model_size
@@ -368,6 +348,9 @@ class MLXSTTBackend:
             if language:
                 decode_options["language"] = language
 
+            # Inference runs with the process's default HF_HUB_OFFLINE
+            # state — see the comment in MLXTTSBackend.generate for the
+            # regression this revert fixes (issue #462).
             result = self.model.generate(str(audio_path), **decode_options)
 
             # Extract text from result

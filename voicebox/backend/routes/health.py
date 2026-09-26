@@ -93,6 +93,12 @@ async def health():
     except ImportError:
         pass
 
+    gpu_compat_warning = None
+    if has_cuda:
+        from ..backends.base import check_cuda_compatibility
+
+        _compatible, gpu_compat_warning = check_cuda_compatibility()
+
     gpu_available = has_cuda or has_mps or has_xpu or has_directml or backend_type == "mlx"
 
     gpu_type = None
@@ -110,6 +116,11 @@ async def health():
     vram_used = None
     if has_cuda:
         vram_used = torch.cuda.memory_allocated() / 1024 / 1024
+    elif has_xpu:
+        try:
+            vram_used = torch.xpu.memory_allocated() / 1024 / 1024
+        except Exception:
+            pass  # memory_allocated() may not be available on all IPEX versions
 
     model_loaded = False
     model_size = None
@@ -162,7 +173,11 @@ async def health():
         gpu_type=gpu_type,
         vram_used_mb=vram_used,
         backend_type=backend_type,
-        backend_variant=os.environ.get("VOICEBOX_BACKEND_VARIANT", "cuda" if torch.cuda.is_available() else "cpu"),
+        backend_variant=os.environ.get(
+            "VOICEBOX_BACKEND_VARIANT",
+            "cuda" if torch.cuda.is_available() else ("xpu" if has_xpu else "cpu"),
+        ),
+        gpu_compatibility_warning=gpu_compat_warning,
     )
 
 
@@ -173,6 +188,7 @@ async def filesystem_health():
 
     dirs_to_check = {
         "generations": config.get_generations_dir(),
+        "captures": config.get_captures_dir(),
         "profiles": config.get_profiles_dir(),
         "data": config.get_data_dir(),
     }

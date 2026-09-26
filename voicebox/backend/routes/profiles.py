@@ -1,6 +1,8 @@
 """Voice profile endpoints."""
 
 import io
+import json as _json
+import logging
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -12,8 +14,10 @@ from sqlalchemy.orm import Session
 from .. import config, models
 from ..app import safe_content_disposition
 from ..database import VoiceProfile as DBVoiceProfile, get_db
-from ..services import channels, export_import, profiles
+from ..services import channels, export_import, personality, profiles
 from ..services.profiles import _profile_to_response
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -61,6 +65,46 @@ async def import_profile(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+# ── Preset Voice Endpoints ───────────────────────────────────────────
+# These MUST be declared before /profiles/{profile_id} to avoid the
+# wildcard swallowing "presets" as a profile_id.
+
+
+@router.get("/profiles/presets/{engine}")
+async def list_preset_voices(engine: str):
+    """List available preset voices for an engine."""
+    if engine == "kokoro":
+        from ..backends.kokoro_backend import KOKORO_VOICES
+
+        return {
+            "engine": engine,
+            "voices": [
+                {
+                    "voice_id": vid,
+                    "name": name,
+                    "gender": gender,
+                    "language": lang,
+                }
+                for vid, name, gender, lang in KOKORO_VOICES
+            ],
+        }
+    if engine == "qwen_custom_voice":
+        from ..backends.qwen_custom_voice_backend import QWEN_CUSTOM_VOICES
+
+        return {
+            "engine": engine,
+            "voices": [
+                {
+                    "voice_id": speaker_id,
+                    "name": display_name,
+                    "gender": gender,
+                    "language": lang,
+                }
+                for speaker_id, display_name, gender, lang, _desc in QWEN_CUSTOM_VOICES
+            ],
+        }
+    return {"engine": engine, "voices": []}
 
 @router.get("/profiles/{profile_id}", response_model=models.VoiceProfileResponse)
 async def get_profile(
@@ -215,8 +259,8 @@ async def get_profile_avatar(
     if not profile.avatar_path:
         raise HTTPException(status_code=404, detail="No avatar found for this profile")
 
-    avatar_path = Path(profile.avatar_path)
-    if not avatar_path.exists():
+    avatar_path = config.resolve_storage_path(profile.avatar_path)
+    if avatar_path is None or not avatar_path.exists():
         raise HTTPException(status_code=404, detail="Avatar file not found")
 
     return FileResponse(avatar_path)
@@ -297,8 +341,6 @@ async def update_profile_effects(
     db: Session = Depends(get_db),
 ):
     """Set or clear the default effects chain for a voice profile."""
-    import json as _json
-
     profile = db.query(DBVoiceProfile).filter_by(id=profile_id).first()
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
@@ -319,3 +361,32 @@ async def update_profile_effects(
     db.refresh(profile)
 
     return _profile_to_response(profile)
+
+
+# ── Personality endpoint ──────────────────────────────────────────────
+# Only ``/profiles/{id}/compose`` remains — the UI's compose button
+# produces a fresh in-character utterance the user can edit before
+# speaking. Rewrite now happens inside ``/generate`` (and ``/speak``)
+# when ``personality=true``; there is no standalone rewrite/respond/speak
+# endpoint.
+
+
+@router.post(
+    "/profiles/{profile_id}/compose",
+    response_model=models.PersonalityTextResponse,
+)
+async def compose_in_character(
+    profile_id: str,
+    db: Session = Depends(get_db),
+):
+    """Produce a fresh utterance in the profile's character voice."""
+    profile = db.query(DBVoiceProfile).filter_by(id=profile_id).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    try:
+        result = await personality.compose_as_profile(profile.personality)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return models.PersonalityTextResponse(
+        text=result.text, model_size=result.model_size
+    )

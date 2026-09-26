@@ -1,6 +1,7 @@
+import { Coffee } from 'lucide-react';
 import Image from 'next/image';
 import Link from 'next/link';
-import { GITHUB_REPO } from '@/lib/constants';
+import { DONATE_URL, GITHUB_REPO } from '@/lib/constants';
 
 export function Footer() {
   return (
@@ -19,9 +20,19 @@ export function Footer() {
               />
               <span className="text-sm font-semibold">Voicebox</span>
             </div>
-            <p className="text-sm text-muted-foreground leading-relaxed">
+            <p className="text-sm text-muted-foreground leading-relaxed mb-4">
               Open source voice cloning studio. Local-first, free forever.
             </p>
+            <a
+              href={DONATE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-2 rounded-lg border border-border/60 bg-card/60 px-3 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground hover:border-[#FFDD00]/40"
+              aria-label="Donate via Buy Me a Coffee"
+            >
+              <Coffee className="h-4 w-4 text-[#FFDD00]" />
+              <span className="text-[13px] font-medium">Donate</span>
+            </a>
           </div>
 
           {/* Product */}
@@ -29,18 +40,33 @@ export function Footer() {
             <h4 className="text-sm font-semibold mb-3">Product</h4>
             <ul className="space-y-2 text-sm text-muted-foreground">
               <li>
-                <a href="#features" className="hover:text-foreground transition-colors">
-                  Features
+                <a href="/#features" className="hover:text-foreground transition-colors">
+                  Clone
                 </a>
               </li>
               <li>
-                <a href="#download" className="hover:text-foreground transition-colors">
+                <a href="/capture" className="hover:text-foreground transition-colors">
+                  Capture
+                </a>
+              </li>
+              <li>
+                <a href="/#mcp" className="hover:text-foreground transition-colors">
+                  MCP
+                </a>
+              </li>
+              <li>
+                <a href="/#about" className="hover:text-foreground transition-colors">
+                  Models
+                </a>
+              </li>
+              <li>
+                <a href="/#api" className="hover:text-foreground transition-colors">
+                  API
+                </a>
+              </li>
+              <li>
+                <a href="/download" className="hover:text-foreground transition-colors">
                   Download
-                </a>
-              </li>
-              <li>
-                <a href="#about" className="hover:text-foreground transition-colors">
-                  About
                 </a>
               </li>
             </ul>
@@ -89,6 +115,11 @@ export function Footer() {
                 >
                   Issues
                 </Link>
+              </li>
+              <li>
+                <a href="/sponsors" className="hover:text-foreground transition-colors">
+                  VIP Sponsor
+                </a>
               </li>
             </ul>
           </div>

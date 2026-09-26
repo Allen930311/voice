@@ -1,13 +1,12 @@
 """Generation history endpoints."""
 
 import io
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
-from .. import models
+from .. import config, models
 from ..services import export_import, history
 from ..app import safe_content_disposition
 from ..database import Generation as DBGeneration, VoiceProfile as DBVoiceProfile, get_db
@@ -63,6 +62,13 @@ async def import_generation(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.delete("/history/failed")
+async def clear_failed_generations(db: Session = Depends(get_db)):
+    """Delete every generation with status='failed'. Used by the UI's 'Clear failed' button (#410)."""
+    count = await history.delete_failed_generations(db)
+    return {"deleted": count}
+
+
 @router.get("/history/{generation_id}", response_model=models.HistoryResponse)
 async def get_generation(
     generation_id: str,
@@ -90,8 +96,11 @@ async def get_generation(
         duration=gen.duration,
         seed=gen.seed,
         instruct=gen.instruct,
+        engine=gen.engine or "qwen",
+        model_size=gen.model_size,
         status=gen.status or "completed",
         error=gen.error,
+        is_favorited=bool(gen.is_favorited),
         created_at=gen.created_at,
     )
 
@@ -164,8 +173,8 @@ async def export_generation_audio(
     if not generation.audio_path:
         raise HTTPException(status_code=404, detail="Generation has no audio file")
 
-    audio_path = Path(generation.audio_path)
-    if not audio_path.is_file():
+    audio_path = config.resolve_storage_path(generation.audio_path)
+    if audio_path is None or not audio_path.is_file():
         raise HTTPException(status_code=404, detail="Audio file not found")
 
     safe_text = "".join(c for c in generation.text[:30] if c.isalnum() or c in (" ", "-", "_")).strip()
