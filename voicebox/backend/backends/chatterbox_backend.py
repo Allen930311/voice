@@ -18,6 +18,8 @@ from . import TTSBackend
 from .base import (
     is_model_cached,
     get_torch_device,
+    empty_device_cache,
+    manual_seed,
     combine_voice_prompts as _combine_voice_prompts,
     model_load_progress,
     patch_chatterbox_f32,
@@ -117,10 +119,7 @@ class ChatterboxTTSBackend:
             del self.model
             self.model = None
             self._device = None
-            if device == "cuda":
-                import torch
-
-                torch.cuda.empty_cache()
+            empty_device_cache(device)
             logger.info("Chatterbox unloaded")
 
     async def create_voice_prompt(
@@ -183,6 +182,7 @@ class ChatterboxTTSBackend:
             language: BCP-47 language code
             seed: Random seed for reproducibility
             instruct: Unused (protocol compatibility)
+            exaggeration: Emotion exaggeration intensity override (0.0-1.0)
 
         Returns:
             Tuple of (audio_array, sample_rate)
@@ -202,7 +202,7 @@ class ChatterboxTTSBackend:
             import torch
 
             if seed is not None:
-                torch.manual_seed(seed)
+                manual_seed(seed, self._device)
 
             logger.info(f"[Chatterbox] Generating: lang={language}, exaggeration={effective_exaggeration}")
 
@@ -222,10 +222,7 @@ class ChatterboxTTSBackend:
             else:
                 audio = np.asarray(wav, dtype=np.float32)
 
-            sample_rate = (
-                getattr(self.model, "sr", None)
-                or getattr(self.model, "sample_rate", 24000)
-            )
+            sample_rate = getattr(self.model, "sr", None) or getattr(self.model, "sample_rate", 24000)
 
             return audio, sample_rate
 

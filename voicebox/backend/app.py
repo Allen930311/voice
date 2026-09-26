@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 
@@ -47,7 +48,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import quote
 
 from . import __version__, config, database
-from .services import tts, transcribe
+from .services import tts, transcribe, llm
 from .database import get_db
 from .utils.platform_detect import get_backend_type, is_openvino_available
 from .utils.progress import get_progress_manager
@@ -68,15 +69,46 @@ def safe_content_disposition(disposition_type: str, filename: str) -> str:
 
 def create_app() -> FastAPI:
     """Create and configure the FastAPI application."""
+    from .mcp_server.server import build_mcp_server, compose_lifespan
+    from .mcp_server.context import ClientIdMiddleware
+
+    # Build the MCP app up-front so we can wire its lifespan into FastAPI's —
+    # FastMCP's Streamable HTTP transport only works if its session manager
+    # runs inside the parent ASGI lifespan.
+    mcp = build_mcp_server()
+    mcp_app = mcp.http_app(path="/", transport="http")
+
+    @asynccontextmanager
+    async def voicebox_lifespan(app: FastAPI):
+        await _run_startup(app)
+        try:
+            yield
+        finally:
+            # Paired with _run_startup via try/finally: runs whether or
+            # not the nested MCP lifespan entered cleanly, so a partial
+            # startup still unloads whatever models were loaded.
+            await _run_shutdown()
+
+    # compose_lifespan enters factories in order (voicebox startup →
+    # MCP startup) and exits in LIFO (MCP teardown first → models
+    # unload last). That ordering matters on shutdown: FastMCP's
+    # __aexit__ cancels in-flight session tasks, and we want that to
+    # happen *before* _run_shutdown yanks the TTS / Whisper / LLM
+    # models out from under any MCP request that was still generating.
+    lifespan = compose_lifespan(voicebox_lifespan, mcp_app.router.lifespan_context)
+
     application = FastAPI(
         title="voicebox API",
         description="Production-quality Qwen3-TTS voice cloning API",
         version=__version__,
+        lifespan=lifespan,
     )
 
     _configure_cors(application)
+    application.add_middleware(ClientIdMiddleware)
     register_routers(application)
-    _register_lifecycle(application)
+    application.mount("/mcp", mcp_app)
+    logger.info("MCP: mounted at /mcp")
     _mount_frontend(application)
 
     return application
@@ -135,7 +167,7 @@ def _mount_frontend(application: FastAPI) -> None:
     async def serve_spa(full_path: str):
         file_path = (frontend_dir / full_path).resolve()
         # Guard against path traversal — only serve files inside frontend_dir
-        if full_path and file_path.is_file() and str(file_path).startswith(str(frontend_dir)):
+        if full_path and file_path.is_file() and file_path.is_relative_to(frontend_dir):
             return FileResponse(file_path)
         return FileResponse(frontend_dir / "index.html", media_type="text/html")
 
@@ -146,109 +178,141 @@ def _get_gpu_status() -> str:
     """Return a human-readable string describing GPU availability."""
     backend_type = get_backend_type()
     if torch.cuda.is_available():
+        from .backends.base import check_cuda_compatibility
+
         device_name = torch.cuda.get_device_name(0)
+        compatible, _warning = check_cuda_compatibility()
         is_rocm = hasattr(torch.version, "hip") and torch.version.hip is not None
         if is_rocm:
-            return f"ROCm ({device_name})"
-        return f"CUDA ({device_name})"
+            label = f"ROCm ({device_name})"
+        else:
+            label = f"CUDA ({device_name})"
+        if not compatible:
+            label += " [UNSUPPORTED - see logs]"
+        return label
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return "MPS (Apple Silicon)"
-    elif is_openvino_available():
+    elif backend_type == "mlx":
+        return "Metal (Apple Silicon via MLX)"
+
+    # Intel XPU (Arc / Data Center) via IPEX
+    try:
+        import intel_extension_for_pytorch  # noqa: F401
+
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            try:
+                xpu_name = torch.xpu.get_device_name(0)
+            except Exception:
+                xpu_name = "Intel GPU"
+            return f"XPU ({xpu_name})"
+    except ImportError:
+        pass
+
+    if is_openvino_available():
         # OpenVINO is our primary acceleration on Intel Windows
         return "OpenVINO (Intel Arc GPU/NPU Acceleration)"
+
     return "None (CPU only)"
 
 
-def _register_lifecycle(application: FastAPI) -> None:
-    """Attach startup and shutdown event handlers."""
+async def _run_startup(application: FastAPI) -> None:
+    """Database init, warnings, model-cache prep. Runs on lifespan entry."""
+    import platform
+    import sys
 
-    @application.on_event("startup")
-    async def startup_event():
-        import platform
-        import sys
+    logger.info("Voicebox v%s starting up", __version__)
+    logger.info(
+        "Python %s on %s %s (%s)",
+        sys.version.split()[0],
+        platform.system(),
+        platform.release(),
+        platform.machine(),
+    )
 
-        logger.info("Voicebox v%s starting up", __version__)
-        logger.info(
-            "Python %s on %s %s (%s)",
-            sys.version.split()[0],
-            platform.system(),
-            platform.release(),
-            platform.machine(),
-        )
+    database.init_db()
 
-        database.init_db()
+    from .database.session import _db_path
 
-        from .database.session import _db_path
+    logger.info("Database: %s", _db_path)
+    logger.info("Data directory: %s", config.get_data_dir())
 
-        logger.info("Database: %s", _db_path)
-        logger.info("Data directory: %s", config.get_data_dir())
+    init_queue()
 
-        init_queue()
+    # Mark stale "generating" records as failed -- leftovers from a killed process
+    from sqlalchemy import text as sa_text
 
-        # Mark stale "generating" records as failed -- leftovers from a killed process
-        from sqlalchemy import text as sa_text
-
-        db = next(get_db())
-        try:
-            result = db.execute(
-                sa_text(
-                    "UPDATE generations SET status = 'failed', "
-                    "error = 'Server was shut down during generation' "
-                    "WHERE status IN ('generating', 'loading_model')"
-                )
+    db = next(get_db())
+    try:
+        result = db.execute(
+            sa_text(
+                "UPDATE generations SET status = 'failed', "
+                "error = 'Server was shut down during generation' "
+                "WHERE status IN ('generating', 'loading_model')"
             )
-            if result.rowcount > 0:
-                logger.info("Marked %d stale generation(s) as failed", result.rowcount)
+        )
+        if result.rowcount > 0:
+            logger.info("Marked %d stale generation(s) as failed", result.rowcount)
 
-            from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
+        from .database import VoiceProfile as DBVoiceProfile, Generation as DBGeneration
 
-            profile_count = db.query(DBVoiceProfile).count()
-            generation_count = db.query(DBGeneration).count()
-            logger.info("Profiles: %d, Generations: %d", profile_count, generation_count)
+        profile_count = db.query(DBVoiceProfile).count()
+        generation_count = db.query(DBGeneration).count()
+        logger.info("Profiles: %d, Generations: %d", profile_count, generation_count)
 
-            db.commit()
-        except Exception as e:
-            db.rollback()
-            logger.warning("Could not clean up stale generations: %s", e)
-        finally:
-            db.close()
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.warning("Could not clean up stale generations: %s", e)
+    finally:
+        db.close()
 
-        backend_type = get_backend_type()
-        logger.info("Backend: %s", backend_type.upper())
-        logger.info("GPU: %s", _get_gpu_status())
+    backend_type = get_backend_type()
+    logger.info("Backend: %s", backend_type.upper())
+    logger.info("GPU: %s", _get_gpu_status())
 
-        from .services.cuda import check_and_update_cuda_binary
+    from .backends.base import check_cuda_compatibility
 
-        create_background_task(check_and_update_cuda_binary())
+    _compatible, _cuda_warning = check_cuda_compatibility()
+    if not _compatible:
+        logger.warning("GPU COMPATIBILITY: %s", _cuda_warning)
 
-        try:
-            progress_manager = get_progress_manager()
-            progress_manager._set_main_loop(asyncio.get_running_loop())
-        except Exception as e:
-            logger.warning("Could not initialize progress manager event loop: %s", e)
+    from .services.cuda import check_and_update_cuda_binary
 
-        try:
-            from huggingface_hub import constants as hf_constants
+    create_background_task(check_and_update_cuda_binary())
 
-            cache_dir = Path(hf_constants.HF_HUB_CACHE)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            logger.info("Model cache: %s", cache_dir)
-        except Exception as e:
-            logger.warning("Could not create HuggingFace cache directory: %s", e)
+    try:
+        progress_manager = get_progress_manager()
+        progress_manager._set_main_loop(asyncio.get_running_loop())
+    except Exception as e:
+        logger.warning("Could not initialize progress manager event loop: %s", e)
 
-        logger.info("Ready")
+    try:
+        from huggingface_hub import constants as hf_constants
 
-    @application.on_event("shutdown")
-    async def shutdown_event():
-        logger.info("Voicebox server shutting down...")
-        try:
-            tts.unload_tts_model()
-        except Exception:
-            logger.exception("Failed to unload TTS model")
-        try:
-            transcribe.unload_whisper_model()
-        except Exception:
-            logger.exception("Failed to unload Whisper model")
+        cache_dir = Path(hf_constants.HF_HUB_CACHE)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Model cache: %s", cache_dir)
+    except Exception as e:
+        logger.warning("Could not create HuggingFace cache directory: %s", e)
+
+    logger.info("Ready")
+
+
+async def _run_shutdown() -> None:
+    """Unload models on lifespan exit."""
+    logger.info("Voicebox server shutting down...")
+    try:
+        tts.unload_tts_model()
+    except Exception:
+        logger.exception("Failed to unload TTS model")
+    try:
+        transcribe.unload_whisper_model()
+    except Exception:
+        logger.exception("Failed to unload Whisper model")
+    try:
+        llm.unload_llm_model()
+    except Exception:
+        logger.exception("Failed to unload LLM model")
 
 
 app = create_app()

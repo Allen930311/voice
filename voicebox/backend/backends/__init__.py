@@ -5,14 +5,23 @@ Provides a unified interface for MLX and PyTorch backends,
 and a model config registry that eliminates per-engine dispatch maps.
 """
 
+# Install HF compatibility patches before any backend imports transformers /
+# huggingface_hub. The module runs ``patch_transformers_mistral_regex`` at
+# import time, which wraps transformers' tokenizer load against the
+# unconditional HuggingFace metadata call that otherwise raises on
+# HF_HUB_OFFLINE=1 and on network failures.
+from ..utils import hf_offline_patch  # noqa: F401
+
 import threading
 from dataclasses import dataclass, field
 from typing import Protocol, Optional, Tuple, List
 from typing_extensions import runtime_checkable
 import numpy as np
 
-from ..utils.platform_detect import get_backend_type
+DEFAULT_LLM_MAX_TOKENS = 512
+DEFAULT_LLM_TEMPERATURE = 0.7
 
+from ..utils.platform_detect import get_backend_type
 from .constants import LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
 
 
@@ -134,20 +143,62 @@ class STTBackend(Protocol):
         ...
 
 
+@runtime_checkable
+class LLMBackend(Protocol):
+    """Protocol for local LLM (chat/completion) backend implementations."""
+
+    async def load_model(self, model_size: str) -> None:
+        """Load LLM weights and tokenizer."""
+        ...
+
+    async def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        max_tokens: int = DEFAULT_LLM_MAX_TOKENS,
+        temperature: float = DEFAULT_LLM_TEMPERATURE,
+        model_size: Optional[str] = None,
+        examples: Optional[list[tuple[str, str]]] = None,
+    ) -> str:
+        """Run a single-turn chat completion and return the assistant reply.
+
+        ``examples`` is an optional list of ``(user, assistant)`` pairs
+        prepended to the conversation as proper chat turns — small models
+        pattern-match on inline system-prompt examples (echoing them
+        verbatim for unrelated inputs), but treat structured turns as
+        data and generalize instead. Used by the refinement service.
+        """
+        ...
+
+    def unload_model(self) -> None:
+        ...
+
+    def is_loaded(self) -> bool:
+        ...
+
+
 # Global backend instances
 _tts_backend: Optional[TTSBackend] = None
 _tts_backends: dict[str, TTSBackend] = {}
 _tts_backends_lock = threading.Lock()
 _stt_backend: Optional[STTBackend] = None
+_llm_backends: dict[str, LLMBackend] = {}
+_llm_backends_lock = threading.Lock()
 
 # Supported TTS engines — keyed by engine name, value is the backend class import path.
 # The factory function uses this for the if/elif chain; the model configs live on the backend classes.
 TTS_ENGINES = {
     "qwen": "Qwen TTS",
+    "qwen_custom_voice": "Qwen CustomVoice",
     "luxtts": "LuxTTS",
     "chatterbox": "Chatterbox TTS",
     "chatterbox_turbo": "Chatterbox Turbo",
     "tada": "TADA",
+    "kokoro": "Kokoro",
+}
+
+LLM_ENGINES = {
+    "qwen_llm": "Qwen3 LLM",
 }
 
 
@@ -156,7 +207,7 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
     backend_type = get_backend_type()
     if backend_type == "mlx":
         repo_1_7b = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"
-        repo_0_6b = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16"  # 0.6B not available in MLX, falls back
+        repo_0_6b = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16"
     else:
         repo_1_7b = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
         repo_0_6b = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
@@ -180,6 +231,32 @@ def _get_qwen_model_configs() -> list[ModelConfig]:
             model_size="0.6B",
             size_mb=1200,
             supports_instruct=False,
+            languages=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
+        ),
+    ]
+
+
+def _get_qwen_custom_voice_configs() -> list[ModelConfig]:
+    """Return Qwen CustomVoice model configs."""
+    return [
+        ModelConfig(
+            model_name="qwen-custom-voice-1.7B",
+            display_name="Qwen CustomVoice 1.7B",
+            engine="qwen_custom_voice",
+            hf_repo_id="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            model_size="1.7B",
+            size_mb=3500,
+            supports_instruct=True,
+            languages=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
+        ),
+        ModelConfig(
+            model_name="qwen-custom-voice-0.6B",
+            display_name="Qwen CustomVoice 0.6B",
+            engine="qwen_custom_voice",
+            hf_repo_id="Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+            model_size="0.6B",
+            size_mb=1200,
+            supports_instruct=True,
             languages=["zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"],
         ),
     ]
@@ -259,6 +336,14 @@ def _get_non_qwen_tts_configs() -> list[ModelConfig]:
             size_mb=8000,
             languages=["en", "ar", "zh", "de", "es", "fr", "it", "ja", "pl", "pt"],
         ),
+        ModelConfig(
+            model_name="kokoro",
+            display_name="Kokoro 82M",
+            engine="kokoro",
+            hf_repo_id="hexgrad/Kokoro-82M",
+            size_mb=350,
+            languages=["en", "es", "fr", "hi", "it", "pt", "ja", "zh"],
+        ),
     ]
 
 
@@ -303,14 +388,81 @@ def _get_whisper_configs() -> list[ModelConfig]:
     ]
 
 
+def _get_qwen_llm_configs() -> list[ModelConfig]:
+    """Return Qwen3 LLM configs with backend-aware HF repo IDs.
+
+    MLX path uses 4-bit community quantizations for Apple Silicon; PyTorch path
+    uses the upstream instruct weights.
+    """
+    backend_type = get_backend_type()
+    if backend_type == "mlx":
+        repo_0_6 = "mlx-community/Qwen3-0.6B-4bit"
+        repo_1_7 = "mlx-community/Qwen3-1.7B-4bit"
+        repo_4 = "mlx-community/Qwen3-4B-4bit"
+    else:
+        repo_0_6 = "Qwen/Qwen3-0.6B"
+        repo_1_7 = "Qwen/Qwen3-1.7B"
+        repo_4 = "Qwen/Qwen3-4B"
+
+    common_languages = [
+        "en", "zh", "ja", "ko", "de", "fr", "ru", "pt", "es", "it",
+    ]
+
+    return [
+        ModelConfig(
+            model_name="qwen3-0.6b",
+            display_name="Qwen3 0.6B",
+            engine="qwen_llm",
+            hf_repo_id=repo_0_6,
+            model_size="0.6B",
+            size_mb=400 if backend_type == "mlx" else 1400,
+            languages=common_languages,
+        ),
+        ModelConfig(
+            model_name="qwen3-1.7b",
+            display_name="Qwen3 1.7B",
+            engine="qwen_llm",
+            hf_repo_id=repo_1_7,
+            model_size="1.7B",
+            size_mb=1100 if backend_type == "mlx" else 3500,
+            languages=common_languages,
+        ),
+        ModelConfig(
+            model_name="qwen3-4b",
+            display_name="Qwen3 4B",
+            engine="qwen_llm",
+            hf_repo_id=repo_4,
+            model_size="4B",
+            size_mb=2500 if backend_type == "mlx" else 8000,
+            languages=common_languages,
+        ),
+    ]
+
+
 def get_all_model_configs() -> list[ModelConfig]:
-    """Return the full list of model configs (TTS + STT)."""
-    return _get_qwen_model_configs() + _get_non_qwen_tts_configs() + _get_whisper_configs()
+    """Return the full list of model configs (TTS + STT + LLM)."""
+    return (
+        _get_qwen_model_configs()
+        + _get_qwen_custom_voice_configs()
+        + _get_non_qwen_tts_configs()
+        + _get_whisper_configs()
+        + _get_qwen_llm_configs()
+    )
 
 
 def get_tts_model_configs() -> list[ModelConfig]:
     """Return only TTS model configs."""
-    return _get_qwen_model_configs() + _get_non_qwen_tts_configs()
+    return _get_qwen_model_configs() + _get_qwen_custom_voice_configs() + _get_non_qwen_tts_configs()
+
+
+def get_llm_model_configs() -> list[ModelConfig]:
+    """Return only LLM model configs."""
+    return _get_qwen_llm_configs()
+
+
+def get_stt_model_configs() -> list[ModelConfig]:
+    """Return only STT (Whisper) model configs."""
+    return _get_whisper_configs()
 
 
 # Lookup helpers — these replace the if/elif chains in main.py
@@ -341,7 +493,7 @@ def engine_has_model_sizes(engine: str) -> bool:
 async def load_engine_model(engine: str, model_size: str = "default") -> None:
     """Load a model for the given engine, handling engines with multiple model sizes."""
     backend = get_tts_backend_for_engine(engine)
-    if engine == "qwen":
+    if engine in ("qwen", "qwen_custom_voice"):
         await backend.load_model_async(model_size)
     elif engine == "tada":
         await backend.load_model(model_size)
@@ -360,7 +512,7 @@ async def ensure_model_cached_or_raise(engine: str, model_size: str = "default")
             cfg = c
             break
 
-    if engine in ("qwen", "tada"):
+    if engine in ("qwen", "qwen_custom_voice", "tada"):
         if not backend._is_model_cached(model_size):
             raise HTTPException(
                 status_code=400,
@@ -378,7 +530,7 @@ async def ensure_model_cached_or_raise(engine: str, model_size: str = "default")
 def unload_model_by_config(config: ModelConfig) -> bool:
     """Unload a model given its config. Returns True if it was loaded, False otherwise."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe
+    from ..services import tts, transcribe, llm as llm_service
 
     if config.engine == "whisper":
         whisper_model = transcribe.get_whisper_model()
@@ -387,11 +539,27 @@ def unload_model_by_config(config: ModelConfig) -> bool:
             return True
         return False
 
+    if config.engine == "qwen_llm":
+        backend = llm_service.get_llm_model()
+        loaded_size = getattr(backend, "_current_model_size", None) or getattr(backend, "model_size", None)
+        if backend.is_loaded() and loaded_size == config.model_size:
+            backend.unload_model()
+            return True
+        return False
+
     if config.engine == "qwen":
         tts_model = tts.get_tts_model()
         loaded_size = getattr(tts_model, "_current_model_size", None) or getattr(tts_model, "model_size", None)
         if tts_model.is_loaded() and loaded_size == config.model_size:
             tts.unload_tts_model()
+            return True
+        return False
+
+    if config.engine == "qwen_custom_voice":
+        backend = get_tts_backend_for_engine(config.engine)
+        loaded_size = getattr(backend, "_current_model_size", None) or getattr(backend, "model_size", None)
+        if backend.is_loaded() and loaded_size == config.model_size:
+            backend.unload_model()
             return True
         return False
 
@@ -406,17 +574,27 @@ def unload_model_by_config(config: ModelConfig) -> bool:
 def check_model_loaded(config: ModelConfig) -> bool:
     """Check if a model is currently loaded."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe
+    from ..services import tts, transcribe, llm as llm_service
 
     try:
         if config.engine == "whisper":
             whisper_model = transcribe.get_whisper_model()
             return whisper_model.is_loaded() and getattr(whisper_model, "model_size", None) == config.model_size
 
+        if config.engine == "qwen_llm":
+            backend = llm_service.get_llm_model()
+            loaded_size = getattr(backend, "_current_model_size", None) or getattr(backend, "model_size", None)
+            return backend.is_loaded() and loaded_size == config.model_size
+
         if config.engine == "qwen":
             tts_model = tts.get_tts_model()
             loaded_size = getattr(tts_model, "_current_model_size", None) or getattr(tts_model, "model_size", None)
             return tts_model.is_loaded() and loaded_size == config.model_size
+
+        if config.engine == "qwen_custom_voice":
+            backend = get_tts_backend_for_engine(config.engine)
+            loaded_size = getattr(backend, "_current_model_size", None) or getattr(backend, "model_size", None)
+            return backend.is_loaded() and loaded_size == config.model_size
 
         backend = get_tts_backend_for_engine(config.engine)
         return backend.is_loaded()
@@ -427,13 +605,19 @@ def check_model_loaded(config: ModelConfig) -> bool:
 def get_model_load_func(config: ModelConfig):
     """Return a callable that loads/downloads the model."""
     from . import get_tts_backend_for_engine
-    from ..services import tts, transcribe
+    from ..services import tts, transcribe, llm as llm_service
 
     if config.engine == "whisper":
         return lambda: transcribe.get_whisper_model().load_model(config.model_size)
 
     if config.engine == "qwen":
         return lambda: tts.get_tts_model().load_model(config.model_size)
+
+    if config.engine == "qwen_custom_voice":
+        return lambda: get_tts_backend_for_engine(config.engine).load_model(config.model_size)
+
+    if config.engine == "qwen_llm":
+        return lambda: llm_service.get_llm_model().load_model(config.model_size)
 
     return lambda: get_tts_backend_for_engine(config.engine).load_model()
 
@@ -496,6 +680,14 @@ def get_tts_backend_for_engine(engine: str) -> TTSBackend:
             from .hume_backend import HumeTadaBackend
 
             backend = HumeTadaBackend()
+        elif engine == "kokoro":
+            from .kokoro_backend import KokoroTTSBackend
+
+            backend = KokoroTTSBackend()
+        elif engine == "qwen_custom_voice":
+            from .qwen_custom_voice_backend import QwenCustomVoiceBackend
+
+            backend = QwenCustomVoiceBackend()
         else:
             raise ValueError(f"Unknown TTS engine: {engine}. Supported: {list(TTS_ENGINES.keys())}")
 
@@ -517,20 +709,57 @@ def get_stt_backend() -> STTBackend:
 
         if backend_type == "mlx":
             from .mlx_backend import MLXSTTBackend
+
             _stt_backend = MLXSTTBackend()
         elif backend_type == "openvino":
             from .ov_accelerate import OVSTTBackend
+
             _stt_backend = OVSTTBackend()
         else:
             from .pytorch_backend import PyTorchSTTBackend
+
             _stt_backend = PyTorchSTTBackend()
 
     return _stt_backend
 
 
+def get_llm_backend() -> LLMBackend:
+    """Get or create the default Qwen3 LLM backend based on platform."""
+    return get_llm_backend_for_engine("qwen_llm")
+
+
+def get_llm_backend_for_engine(engine: str) -> LLMBackend:
+    """Get or create an LLM backend for the given engine."""
+    global _llm_backends
+
+    if engine in _llm_backends:
+        return _llm_backends[engine]
+
+    with _llm_backends_lock:
+        if engine in _llm_backends:
+            return _llm_backends[engine]
+
+        if engine == "qwen_llm":
+            backend_type = get_backend_type()
+            if backend_type == "mlx":
+                from .qwen_llm_backend import MLXQwenLLMBackend
+
+                backend = MLXQwenLLMBackend()
+            else:
+                from .qwen_llm_backend import PyTorchQwenLLMBackend
+
+                backend = PyTorchQwenLLMBackend()
+        else:
+            raise ValueError(f"Unknown LLM engine: {engine}. Supported: {list(LLM_ENGINES.keys())}")
+
+        _llm_backends[engine] = backend
+        return backend
+
+
 def reset_backends():
     """Reset backend instances (useful for testing)."""
-    global _tts_backend, _tts_backends, _stt_backend
+    global _tts_backend, _tts_backends, _stt_backend, _llm_backends
     _tts_backend = None
     _tts_backends.clear()
     _stt_backend = None
+    _llm_backends.clear()

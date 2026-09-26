@@ -58,7 +58,7 @@ if __name__ == "__main__":
 
     # Import the app ONLY after environment variables are configured
     from .app import app
-    
+
     print(f"Starting server with backend: {os.environ.get('VOICEBOX_BACKEND', 'auto')}")
 
     uvicorn.run(

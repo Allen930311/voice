@@ -6,7 +6,7 @@ from typing import Literal
 def is_apple_silicon() -> bool:
     """
     Check if running on Apple Silicon (arm64 macOS).
-    
+
     Returns:
         True if on Apple Silicon, False otherwise
     """
@@ -16,7 +16,7 @@ def is_apple_silicon() -> bool:
 def is_openvino_available() -> bool:
     """
     Check if OpenVINO and optimum-intel are available in the current environment.
-    
+
     Returns:
         True if OpenVINO is available, False otherwise
     """
@@ -33,7 +33,7 @@ def get_backend_type() -> Literal["mlx", "pytorch", "openvino"]:
     Detect the best backend for the current platform.
 
     Returns:
-        "mlx" on Apple Silicon (if MLX is available and functional), 
+        "mlx" on Apple Silicon (if MLX is available and functional),
         "openvino" if OpenVINO is available, "pytorch" otherwise.
         Can be overridden by VOICEBOX_BACKEND environment variable.
     """

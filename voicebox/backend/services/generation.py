@@ -16,6 +16,7 @@ Mode differences:
 
 from __future__ import annotations
 
+import asyncio
 import traceback
 from typing import Literal, Optional
 
@@ -129,6 +130,14 @@ async def run_generation(
             duration=duration,
         )
 
+    except asyncio.CancelledError:
+        await history.update_generation_status(
+            generation_id=generation_id,
+            status="failed",
+            db=bg_db,
+            error="Generation cancelled",
+        )
+        _notify_speak_end(generation_id, status="cancelled")
     except Exception as e:
         traceback.print_exc()
         await history.update_generation_status(
@@ -137,9 +146,26 @@ async def run_generation(
             db=bg_db,
             error=str(e),
         )
+        _notify_speak_end(generation_id, status="failed")
+    else:
+        _notify_speak_end(generation_id, status="completed")
     finally:
         task_manager.complete_generation(generation_id)
         bg_db.close()
+
+
+def _notify_speak_end(generation_id: str, *, status: str) -> None:
+    """Publish a speak-end event; the frontend ignores unknown ids."""
+    try:
+        from ..mcp_server import events as mcp_events
+
+        mcp_events.publish(
+            "speak-end",
+            {"generation_id": generation_id, "status": status},
+        )
+    except Exception:
+        # Never let event pub/sub break generation completion.
+        pass
 
 
 def _save_generate(
@@ -166,7 +192,7 @@ def _save_generate(
     versions_mod.create_version(
         generation_id=generation_id,
         label="original",
-        audio_path=str(clean_audio_path),
+        audio_path=config.to_storage_path(clean_audio_path),
         db=db,
         effects_chain=None,
         is_default=not has_effects,
@@ -176,6 +202,8 @@ def _save_generate(
 
     if has_effects:
         from ..utils.effects import apply_effects, validate_effects_chain
+
+        assert effects_chain is not None
 
         error_msg = validate_effects_chain(effects_chain)
         if error_msg:
@@ -192,13 +220,13 @@ def _save_generate(
             versions_mod.create_version(
                 generation_id=generation_id,
                 label="version-2",
-                audio_path=str(processed_path),
+                audio_path=config.to_storage_path(processed_path),
                 db=db,
                 effects_chain=effects_chain,
                 is_default=True,
             )
 
-    return final_audio_path
+    return config.to_storage_path(final_audio_path)
 
 
 def _save_retry(
@@ -214,7 +242,74 @@ def _save_retry(
     """
     audio_path = config.get_generations_dir() / f"{generation_id}.wav"
     save_audio(audio, str(audio_path), sample_rate)
-    return str(audio_path)
+    return config.to_storage_path(audio_path)
+
+
+async def generate_audio_sync(
+    *,
+    profile_id: str,
+    text: str,
+    language: str,
+    engine: str,
+    model_size: str,
+    seed: Optional[int] = None,
+    instruct: Optional[str] = None,
+    normalize: bool = True,
+    max_chunk_chars: Optional[int] = None,
+    crossfade_ms: Optional[int] = None,
+) -> bytes:
+    """Run a TTS generation synchronously and return the resulting wav bytes.
+
+    Unlike :func:`run_generation`, this path does not touch the
+    ``generations`` table, enqueue work, or write anything to the
+    generations directory. It's used by ``POST /profiles/{id}/speak``
+    when the caller passes ``persist=false`` — they just want the audio
+    back in the HTTP response without polluting their history.
+
+    Loads the engine model on demand, runs ``generate_chunked``, optional
+    normalize, then encodes in-memory via :func:`tts.audio_to_wav_bytes`
+    (same helper ``/generate/stream`` uses).
+    """
+    from ..backends import load_engine_model, get_tts_backend_for_engine, engine_needs_trim
+    from ..utils.chunked_tts import generate_chunked
+    from ..utils.audio import normalize_audio, trim_tts_output
+    from . import tts
+
+    bg_db = next(get_db())
+    try:
+        tts_model = get_tts_backend_for_engine(engine)
+        await load_engine_model(engine, model_size)
+
+        voice_prompt = await profiles.create_voice_prompt_for_profile(
+            profile_id,
+            bg_db,
+            use_cache=True,
+            engine=engine,
+        )
+    finally:
+        bg_db.close()
+
+    trim_fn = trim_tts_output if engine_needs_trim(engine) else None
+
+    gen_kwargs: dict = dict(
+        language=language,
+        seed=seed,
+        instruct=instruct,
+        trim_fn=trim_fn,
+    )
+    if max_chunk_chars is not None:
+        gen_kwargs["max_chunk_chars"] = max_chunk_chars
+    if crossfade_ms is not None:
+        gen_kwargs["crossfade_ms"] = crossfade_ms
+
+    audio, sample_rate = await generate_chunked(
+        tts_model, text, voice_prompt, **gen_kwargs
+    )
+
+    if normalize:
+        audio = normalize_audio(audio)
+
+    return tts.audio_to_wav_bytes(audio, sample_rate)
 
 
 def _save_regenerate(
@@ -247,10 +342,10 @@ def _save_regenerate(
     versions_mod.create_version(
         generation_id=generation_id,
         label=label,
-        audio_path=str(audio_path),
+        audio_path=config.to_storage_path(audio_path),
         db=db,
         effects_chain=None,
         is_default=True,
     )
 
-    return str(audio_path)
+    return config.to_storage_path(audio_path)

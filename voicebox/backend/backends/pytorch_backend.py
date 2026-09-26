@@ -16,6 +16,8 @@ from .constants import WHISPER_HF_REPOS, LANGUAGE_CODE_TO_NAME
 from .base import (
     is_model_cached,
     get_torch_device,
+    empty_device_cache,
+    manual_seed,
     combine_voice_prompts as _combine_voice_prompts,
     model_load_progress,
 )
@@ -114,9 +116,17 @@ class PyTorchTTSBackend:
             model_path = self._get_model_path(model_size)
             logger.info("Loading TTS model %s on %s...", model_size, self.device)
 
+            # Route both HF Hub and Transformers through a single cache root.
+            # On Windows local setups, model assets can otherwise split between
+            # .hf-cache/hub and .hf-cache/transformers, causing speech_tokenizer
+            # and preprocessor_config.json to fail to resolve during load.
+            from huggingface_hub import constants as hf_constants
+            tts_cache_dir = hf_constants.HF_HUB_CACHE
+
             if self.device == "cpu":
                 self.model = Qwen3TTSModel.from_pretrained(
                     model_path,
+                    cache_dir=tts_cache_dir,
                     torch_dtype=torch.float32,
                     low_cpu_mem_usage=False,
                 )
@@ -124,6 +134,7 @@ class PyTorchTTSBackend:
                 try:
                     self.model = Qwen3TTSModel.from_pretrained(
                         model_path,
+                        cache_dir=tts_cache_dir,
                         device_map=self.device,
                         torch_dtype=torch.bfloat16,
                     )
@@ -134,6 +145,7 @@ class PyTorchTTSBackend:
                     self.device = "cpu"
                     self.model = Qwen3TTSModel.from_pretrained(
                         model_path,
+                        cache_dir=tts_cache_dir,
                         torch_dtype=torch.float32,
                         low_cpu_mem_usage=False,
                     )
@@ -149,8 +161,7 @@ class PyTorchTTSBackend:
             self.model = None
             self._current_model_size = None
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
             logger.info("TTS model unloaded")
 
@@ -191,6 +202,10 @@ class PyTorchTTSBackend:
 
         def _create_prompt_sync():
             """Run synchronous voice prompt creation in thread pool."""
+            # Inference runs with the process's default HF_HUB_OFFLINE
+            # state. Forcing offline here (issue #462) regressed online
+            # users whose libraries issue legitimate metadata lookups
+            # during voice-prompt creation.
             return self.model.create_voice_clone_prompt(
                 ref_audio=str(audio_path),
                 ref_text=reference_text,
@@ -242,11 +257,10 @@ class PyTorchTTSBackend:
             """Run synchronous generation in thread pool."""
             # Set seed if provided
             if seed is not None:
-                torch.manual_seed(seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed(seed)
+                manual_seed(seed, self.device)
 
-            # Generate audio - this is the blocking operation
+            # See _create_prompt_sync comment — inference runs with the
+            # process's default HF_HUB_OFFLINE state (issue #462).
             wavs, sample_rate = self.model.generate_voice_clone(
                 text=text,
                 voice_clone_prompt=voice_prompt,
@@ -328,9 +342,9 @@ class PyTorchSTTBackend:
             # 根據 Benchmark，tiny 模型走 CPU 開銷最小；其餘模型嘗試 OpenVINO GPU/NPU
             use_ov = False
             is_tiny = "tiny" in model_size.lower()
-            
+
             enable_npu = os.environ.get("ENABLE_EXPERIMENTAL_NPU", "0") == "1"
-            
+
             if is_tiny:
                 logger.info("Tiny model detected: using standard PyTorch CPU for optimal low-latency (Bench: RTF 0.05-0.08x)")
                 use_ov = False
@@ -339,7 +353,7 @@ class PyTorchSTTBackend:
                     logger.info("OpenVINO: Attempting acceleration for %s (NPU Experimental: %s)", model_size, enable_npu)
                     from .ov_accelerate import get_best_ov_device, safe_load_ov_model
                     target_device = get_best_ov_device(exclude_npu=not enable_npu)
-                    
+
                     if target_device and target_device != "CPU":
                         logger.info("OpenVINO: Found accelerator %s, routing %s...", target_device, model_size)
                         self.model = safe_load_ov_model(model_id, "stt", device=target_device)
@@ -373,8 +387,7 @@ class PyTorchSTTBackend:
             self.model = None
             self.processor = None
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            empty_device_cache(self.device)
 
             logger.info("Whisper model unloaded")
 
@@ -400,8 +413,12 @@ class PyTorchSTTBackend:
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
             # Load audio
-            audio, sr = load_audio(audio_path, sample_rate=16000)
+            audio, _sr = load_audio(audio_path, sample_rate=16000)
 
+            # Inference runs with the process's default HF_HUB_OFFLINE
+            # state — forcing offline here (issue #462) broke online users
+            # whose `get_decoder_prompt_ids` / tokenizer calls issue
+            # legitimate metadata lookups.
             # Process audio
             inputs = self.processor(
                 audio,
