@@ -51,11 +51,11 @@ def get_best_ov_device(exclude_npu: bool = False) -> Optional[str]:
             
         for dev in priority:
             if dev in available:
-                print(f"[OV] 🚀 選定最優硬體加速器: {dev}")
+                print(f"[OV] [OK] 選定最優硬體加速器: {dev}")
                 return dev
         return None
     except Exception as e:
-        print(f"[OV] ❌ 裝置偵測失敗: {e}")
+        print(f"[OV] [FAIL] 裝置偵測失敗: {e}")
         return None
 
 
@@ -243,10 +243,10 @@ class OVHFModel:
                 trust_remote_code=True,
                 **kwargs,
             )
-            print(f"[OV] ✅ {model_id} 已成功在 {device} 上運行！")
+            print(f"[OV] [OK] {model_id} 已成功在 {device} 上運行！")
             return cls(ov_model)
         except Exception as e:
-            print(f"[OV] ❌ {model_id} 佈署至 {device} 失敗: {e}")
+            print(f"[OV] [FAIL] {model_id} 佈署至 {device} 失敗: {e}")
             return cls(None)
 
     def is_available(self) -> bool:

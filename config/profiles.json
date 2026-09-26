@@ -1,0 +1,59 @@
+{
+  "_comment": "Voicebox Profile ID 統一管理。新增/修改 profile 請更新此檔，不要在各腳本硬編碼。",
+  "backend_url": "http://127.0.0.1:17493",
+  "profiles": {
+    "germany-ww2": {
+      "id": "f9b3a288-2e86-4156-8dfd-42b70ece7283",
+      "name": "Germany WW2 Shorts",
+      "language": "en",
+      "engine": "qwen",
+      "model_size": "1.7B"
+    },
+    "narrator-zh": {
+      "id": "27883698-73ed-484f-965d-899b89ae99af",
+      "name": "解說男聲",
+      "language": "zh",
+      "engine": "qwen",
+      "model_size": "1.7B"
+    },
+    "ohtani": {
+      "id": "6eca2ef5-f809-4a8b-8677-608f97e8e3cb",
+      "name": "Shohei Ohtani",
+      "language": "zh",
+      "engine": "qwen",
+      "model_size": "1.7B"
+    },
+    "ohtani-10s": {
+      "id": "37ca7765-44df-417f-9ce6-fee34dae5e58",
+      "name": "Shohei Ohtani 10s",
+      "language": "zh",
+      "engine": "chatterbox",
+      "model_size": "default"
+    },
+    "en-female": {
+      "id": "4cab8f9d-8e67-4dae-9c30-ff0a770823c5",
+      "name": "English Female (Listen and Repeat)",
+      "language": "en",
+      "engine": "qwen",
+      "model_size": "1.7B"
+    },
+    "adam": {
+      "id": "bbd947af-0c50-48a7-84d8-a0581ceced69",
+      "name": "Adam - Dominant",
+      "language": "en",
+      "engine": "qwen",
+      "model_size": "1.7B"
+    },
+    "clone-test": {
+      "id": "a23a9c93-f651-4eec-a1bd-bc6f6b0d5b9b",
+      "name": "CloneTest_01",
+      "language": "zh",
+      "engine": "chatterbox",
+      "model_size": "default"
+    }
+  },
+  "social_defaults": {
+    "en": "germany-ww2",
+    "zh": "narrator-zh"
+  }
+}

@@ -300,7 +300,23 @@ def build_server(cuda=False):
             ]
         )
     elif not cuda:
-        logger.info("Building for non-Apple Silicon platform - PyTorch only")
+        logger.info("Building for non-Apple Silicon platform - PyTorch + OpenVINO")
+        args.extend(
+            [
+                "--hidden-import",
+                "backend.backends.ov_accelerate",
+                "--hidden-import",
+                "openvino",
+                "--collect-all",
+                "openvino",
+                "--hidden-import",
+                "optimum.intel",
+                "--collect-all",
+                "optimum",
+                "--hidden-import",
+                "nncf",
+            ]
+        )
 
     dist_dir = str(backend_dir / "dist")
     build_dir = str(backend_dir / "build")

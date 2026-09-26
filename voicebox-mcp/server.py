@@ -28,6 +28,17 @@ GPU_LAUNCHER = Path(os.getenv(
     r"c:\Users\Allen\OneDrive\Desktop\Voicebox\scripts\start-voicebox-gpu.ps1",
 ))
 
+# ── Profile 設定（從 config/profiles.json 讀取，不硬編碼）──
+_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "profiles.json"
+
+def _load_profiles_config() -> dict:
+    if _CONFIG_PATH.exists():
+        with open(_CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return {"profiles": {}, "social_defaults": {"en": "", "zh": ""}}
+
+_profiles_config = _load_profiles_config()
+
 mcp = FastMCP(
     "voicebox",
     instructions=(
@@ -74,8 +85,8 @@ async def _ensure_backend_ready(start_if_down: bool = True) -> tuple[bool, str]:
         creationflags=subprocess.CREATE_NEW_CONSOLE if os.name == "nt" else 0,
     )
 
-    # 3. 等待後端就緒（最多 40 秒）
-    for i in range(40):
+    # 3. 等待後端就緒（最多 90 秒，與 start-voicebox-gpu.ps1 的等待上限一致）
+    for i in range(90):
         await asyncio.sleep(1)
         try:
             async with _client() as c:
@@ -87,17 +98,27 @@ async def _ensure_backend_ready(start_if_down: bool = True) -> tuple[bool, str]:
         except (httpx.ConnectError, httpx.TimeoutException):
             continue
 
-    return False, "GPU 後端啟動逾時（40 秒），請手動確認"
+    return False, "GPU 後端啟動逾時（90 秒），請手動確認"
+
+
+def _max_polls(text: str) -> int:
+    """輪詢次數依文本長度自適應：基準 120 次（10 分鐘），每 3 字加 1 次，上限 360 次（30 分鐘）。
+
+    KB 案例（2026-05-14 revoice_ohtani）：1800 字長文本在固定 120 次時超時，
+    但音訊其實已生成——上限不足會誤導成「失敗」而重複生成。
+    """
+    return min(360, 120 + len(text) // 3)
 
 
 async def _poll_generation(
     client: httpx.AsyncClient,
     gen_id: str,
     output_path: Optional[str] = None,
+    max_polls: int = 120,
 ) -> tuple:
     """輪詢直到生成完成，回傳 (status_data, saved_path_or_None)。"""
     status_data: dict = {}
-    for _ in range(120):
+    for _ in range(max_polls):
         await asyncio.sleep(5)
         try:
             r = await client.get(f"/history/{gen_id}")
@@ -112,7 +133,7 @@ async def _poll_generation(
                     and status_data.get("audio_path", "")):
                 break
             # status=completed but audio not ready yet — keep waiting
-        except httpx.HTTPStatusError:
+        except (httpx.HTTPStatusError, httpx.RemoteProtocolError, httpx.ConnectError):
             continue
     else:
         status_data["_timeout"] = True
@@ -420,58 +441,70 @@ async def voicebox_generate(
     if instruct:
         payload["instruct"] = instruct
 
-    async with _client() as c:
-        # 1. 觸發生成
-        r = await c.post("/generate", json=payload)
-        r.raise_for_status()
-        gen = r.json()
-        gen_id = gen["id"]
+    gen_id: str = ""
+    try:
+        async with _client() as c:
+            # 1. 觸發生成
+            r = await c.post("/generate", json=payload)
+            r.raise_for_status()
+            gen = r.json()
+            gen_id = gen["id"]
 
-        # 2. 輪詢等待完成（SSE 在 MCP 中不方便，改用輪詢）
-        status_data: dict = {}
-        for _ in range(120):  # 最多等 10 分鐘
-            await asyncio.sleep(5)
-            try:
-                r2 = await c.get(f"/history/{gen_id}")
-                r2.raise_for_status()
-                status_data = r2.json()
-                status = status_data.get("status", "pending")
-                if status == "failed":
-                    err = status_data.get("error", "未知錯誤")
-                    return f"❌ 生成失敗：{err}"
-                # Triple validation: completed + audio_path non-empty + duration>0
-                if (status == "completed"
-                        and status_data.get("duration", 0) > 0
-                        and status_data.get("audio_path", "")):
-                    break
-                # status=completed but audio not ready — keep waiting
-            except httpx.HTTPStatusError:
-                continue
-        else:
-            return "⏳ 生成超時（超過 10 分鐘），請稍後用 voicebox_history 查看狀態。"
+            # 2. 輪詢等待完成（SSE 在 MCP 中不方便，改用輪詢；上限依文本長度自適應）
+            status_data: dict = {}
+            polls = _max_polls(text)
+            for _ in range(polls):
+                await asyncio.sleep(5)
+                try:
+                    r2 = await c.get(f"/history/{gen_id}")
+                    r2.raise_for_status()
+                    status_data = r2.json()
+                    status = status_data.get("status", "pending")
+                    if status == "failed":
+                        err = status_data.get("error", "未知錯誤")
+                        return f"❌ 生成失敗：{err}（gen_id=`{gen_id}`）"
+                    # Triple validation: completed + audio_path non-empty + duration>0
+                    if (status == "completed"
+                            and status_data.get("duration", 0) > 0
+                            and status_data.get("audio_path", "")):
+                        break
+                    # status=completed but audio not ready — keep waiting
+                except (httpx.HTTPStatusError, httpx.RemoteProtocolError, httpx.ConnectError):
+                    continue
+            else:
+                return f"⏳ 生成超時（超過 {polls * 5 // 60} 分鐘）。gen_id=`{gen_id}`，請用 voicebox_history 查看狀態，勿重試。"
 
-        # 3. 如果指定了 output_path，下載音訊
-        audio_info = ""
-        if output_path:
-            r3 = await c.get(f"/audio/{gen_id}")
-            r3.raise_for_status()
-            out = Path(output_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_bytes(r3.content)
-            audio_info = f"\n音訊已儲存至：{out}"
+            # 3. 如果指定了 output_path，下載音訊
+            audio_info = ""
+            if output_path:
+                r3 = await c.get(f"/audio/{gen_id}")
+                r3.raise_for_status()
+                out = Path(output_path)
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_bytes(r3.content)
+                audio_info = f"\n音訊已儲存至：{out}"
 
-        duration = status_data.get("duration")
-        dur_str = f"{duration:.1f} 秒" if duration else "未知"
+            duration = status_data.get("duration")
+            dur_str = f"{duration:.1f} 秒" if duration else "未知"
 
-        return (
-            f"✅ 配音生成完成！\n"
-            f"Generation ID: `{gen_id}`\n"
-            f"引擎: {engine} ({model_size})\n"
-            f"時長: {dur_str}\n"
-            f"文字: {text[:100]}{'...' if len(text) > 100 else ''}"
-            f"{audio_info}\n\n"
-            f"使用 voicebox_download_audio 可下載音訊檔。"
-        )
+            return (
+                f"✅ 配音生成完成！\n"
+                f"Generation ID: `{gen_id}`\n"
+                f"引擎: {engine} ({model_size})\n"
+                f"時長: {dur_str}\n"
+                f"文字: {text[:100]}{'...' if len(text) > 100 else ''}"
+                f"{audio_info}\n\n"
+                f"使用 voicebox_download_audio 可下載音訊檔。"
+            )
+    except Exception as e:
+        if gen_id:
+            return (
+                f"⚠️ MCP 傳輸層錯誤（任務已提交後台，請勿重試）\n"
+                f"gen_id=`{gen_id}`\n"
+                f"錯誤：{e}\n\n"
+                f"請直接用 voicebox_history 確認狀態，再用 voicebox_download_audio 下載。"
+            )
+        raise
 
 
 @mcp.tool()
@@ -619,6 +652,10 @@ async def voicebox_apply_effects(
     except json.JSONDecodeError:
         return "❌ effects_chain 必須是合法的 JSON 字串。"
 
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
     async with _client() as c:
         r = await c.post(
             f"/generations/{generation_id}/versions/apply-effects",
@@ -648,6 +685,10 @@ async def voicebox_transcribe(
     ap = Path(audio_path)
     if not ap.exists():
         return f"❌ 找不到檔案：{audio_path}"
+
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
 
     async with _client() as c:
         with open(ap, "rb") as f:
@@ -688,6 +729,10 @@ async def voicebox_clone_voice(
     ap = Path(audio_path)
     if not ap.exists():
         return f"❌ 找不到檔案：{audio_path}"
+
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
 
     async with _client() as c:
         # Step 1: 建立 Profile
@@ -807,6 +852,10 @@ async def voicebox_sing(
     if not lines:
         return "❌ 歌詞不可為空。"
 
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
     STYLE_MAP = {
         "ballad": {
             "separator": " [breath] ",
@@ -865,7 +914,8 @@ async def voicebox_sing(
         r = await c.post("/generate", json=payload)
         r.raise_for_status()
         gen_id = r.json()["id"]
-        status_data, saved_path = await _poll_generation(c, gen_id, output_path)
+        status_data, saved_path = await _poll_generation(
+            c, gen_id, output_path, max_polls=_max_polls(formatted_text))
 
     if status_data.get("_timeout"):
         return "⏳ 生成超時，請稍後用 voicebox_history 查看。"
@@ -927,6 +977,10 @@ async def voicebox_narrate(
         seed: 隨機種子
         output_path: 輸出音訊儲存路徑
     """
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
     STYLE_PRESETS = {
         "dramatic": {
             "desc": "戲劇性旁白",
@@ -1025,7 +1079,8 @@ async def voicebox_narrate(
         r = await c.post("/generate", json=payload)
         r.raise_for_status()
         gen_id = r.json()["id"]
-        status_data, saved_path = await _poll_generation(c, gen_id, output_path)
+        status_data, saved_path = await _poll_generation(
+            c, gen_id, output_path, max_polls=_max_polls(formatted_text))
 
     if status_data.get("_timeout"):
         return "⏳ 生成超時，請稍後用 voicebox_history 查看。"
@@ -1077,6 +1132,10 @@ async def voicebox_voice_morph(
         custom_chain: 自訂 JSON 音效鏈（提供時忽略 preset）
                       格式：[{"type": "reverb", "enabled": true, "params": {...}}]
     """
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
     MORPHS: dict = {
         "villain": [
             {"type": "pitch_shift", "enabled": True, "params": {"semitones": -3.0}},
@@ -1185,6 +1244,120 @@ async def voicebox_voice_morph(
         f"版本 ID: `{v.get('id', '?')}`\n"
         f"預設: {preset} — {desc}\n\n"
         f"使用 voicebox_download_audio 下載，或 voicebox_voice_morph 疊加更多效果。"
+    )
+
+
+# ─── Social-v3-lean 快捷工具 ───
+
+SOCIAL_OUTPUT_DIR = Path(r"C:\Users\Allen\OneDrive\Desktop\remotion\public")
+
+
+@mcp.tool()
+async def voicebox_generate_for_social(
+    text: str,
+    language: str = "en",
+    style: str = "documentary",
+    out_name: str = "narration.wav",
+    seed: Optional[int] = None,
+) -> str:
+    """🎬 Social-v3-lean 專用：一鍵生成配音並輸出至 Remotion public 目錄。
+
+    Profile 與引擎設定從 config/profiles.json 的 social_defaults 讀取，不硬編碼。
+    支援自訂輸出檔名，可生成多場景 (scene-01.wav, scene-02.wav ...)。
+
+    Args:
+        text: 旁白文字
+        language: en 或 zh
+        style: 解說風格 — documentary / dramatic / storytelling / news / podcast / whisper
+        out_name: 輸出檔名（在 remotion/public/ 下，預設 narration.wav）
+        seed: 固定種子可重現音色（可選）
+    """
+    defaults = _profiles_config.get("social_defaults", {})
+    voice_key = defaults.get(language)
+    if not voice_key:
+        return f"❌ config/profiles.json 的 social_defaults 沒有設定語言 '{language}'"
+
+    profiles = _profiles_config.get("profiles", {})
+    if voice_key not in profiles:
+        return f"❌ profiles.json 找不到 voice key '{voice_key}'，請確認 config/profiles.json"
+
+    p = profiles[voice_key]
+    profile_id = p["id"]
+    engine = p.get("engine", "qwen")
+
+    STYLE_PRESETS = {
+        "dramatic": {"transform": "dramatic", "effects": [
+            {"type": "reverb", "enabled": True, "params": {"room_size": 0.55, "damping": 0.35, "wet_level": 0.3, "dry_level": 0.85, "width": 0.9}},
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -20.0, "ratio": 4.0, "attack_ms": 5.0, "release_ms": 100.0}},
+        ]},
+        "documentary": {"transform": "measured", "effects": [
+            {"type": "reverb", "enabled": True, "params": {"room_size": 0.3, "damping": 0.6, "wet_level": 0.18, "dry_level": 0.9, "width": 0.7}},
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -22.0, "ratio": 3.5, "attack_ms": 8.0, "release_ms": 120.0}},
+        ]},
+        "storytelling": {"transform": "narrative", "effects": [
+            {"type": "reverb", "enabled": True, "params": {"room_size": 0.35, "damping": 0.5, "wet_level": 0.2, "dry_level": 0.92, "width": 0.8}},
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -24.0, "ratio": 3.0, "attack_ms": 12.0, "release_ms": 150.0}},
+        ]},
+        "news": {"transform": "crisp", "effects": [
+            {"type": "highpass", "enabled": True, "params": {"cutoff_frequency_hz": 120.0}},
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -18.0, "ratio": 5.0, "attack_ms": 3.0, "release_ms": 60.0}},
+            {"type": "gain", "enabled": True, "params": {"gain_db": 2.0}},
+        ]},
+        "podcast": {"transform": "natural", "effects": [
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -20.0, "ratio": 3.5, "attack_ms": 10.0, "release_ms": 100.0}},
+            {"type": "gain", "enabled": True, "params": {"gain_db": 1.0}},
+        ]},
+        "whisper": {"transform": "whisper", "effects": [
+            {"type": "lowpass", "enabled": True, "params": {"cutoff_frequency_hz": 7000.0}},
+            {"type": "compressor", "enabled": True, "params": {"threshold_db": -28.0, "ratio": 5.0, "attack_ms": 5.0, "release_ms": 80.0}},
+        ]},
+    }
+
+    if style not in STYLE_PRESETS:
+        return f"❌ 未知風格 '{style}'。可用：{', '.join(STYLE_PRESETS.keys())}"
+
+    preset = STYLE_PRESETS[style]
+    formatted_text = _format_prosody(text, preset["transform"], language)
+
+    ready, backend_msg = await _ensure_backend_ready(start_if_down=True)
+    if not ready:
+        return f"❌ 後端無法啟動：{backend_msg}"
+
+    payload: dict = {
+        "profile_id": profile_id,
+        "text": formatted_text,
+        "language": language,
+        "engine": engine,
+        "model_size": "1.7B" if engine == "qwen" else "default",
+        "normalize": True,
+        "effects_chain": preset["effects"],
+    }
+    if seed is not None:
+        payload["seed"] = max(0, seed)
+
+    out_path = SOCIAL_OUTPUT_DIR / out_name
+
+    async with _client() as c:
+        r = await c.post("/generate", json=payload)
+        r.raise_for_status()
+        gen_id = r.json()["id"]
+        status_data, saved_path = await _poll_generation(
+            c, gen_id, str(out_path), max_polls=_max_polls(formatted_text))
+
+    if status_data.get("_timeout"):
+        return f"⏳ 生成超時。gen_id=`{gen_id}`，請用 voicebox_history 確認後再手動下載。"
+    if status_data.get("status") == "failed":
+        return f"❌ 生成失敗：{status_data.get('error', '未知錯誤')}（gen_id=`{gen_id}`）"
+
+    dur = status_data.get("duration")
+    dur_str = f"{dur:.1f} 秒" if dur else "未知"
+
+    return (
+        f"🎬 Social 配音完成！\n"
+        f"Generation ID: `{gen_id}`\n"
+        f"Profile: {language.upper()} ({p['name']}) | 引擎: {engine} | 風格: {style} | 時長: {dur_str}\n"
+        f"✅ 已輸出至：{out_path}\n\n"
+        f"📝 文字：{formatted_text[:200]}{'...' if len(formatted_text) > 200 else ''}"
     )
 
 

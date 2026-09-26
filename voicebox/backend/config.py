@@ -18,8 +18,23 @@ if _custom_models_dir:
     os.environ["HF_HUB_CACHE"] = _custom_models_dir
     logger.info("Model download path set to: %s", _custom_models_dir)
 
-# Default data directory (used in development)
-_data_dir = Path("data")
+# Resolve the data directory with the following priority:
+# 1. VOICEBOX_DATA_DIR environment variable (explicit override)
+# 2. Frozen executable: <executable>/../data  (e.g. Tauri sidecar)
+# 3. Development: project root (two levels up from this file: backend/ -> voicebox/ -> root)
+def _resolve_data_dir() -> Path:
+    env_dir = os.environ.get("VOICEBOX_DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    if getattr(__import__("sys"), "frozen", False):
+        import sys
+        return Path(sys.executable).parent.parent / "data"
+    # __file__ = .../Voicebox/voicebox/backend/config.py
+    # parents[2] = .../Voicebox  (project root)
+    return Path(__file__).resolve().parents[2] / "data"
+
+
+_data_dir = _resolve_data_dir()
 
 
 def set_data_dir(path: str | Path):

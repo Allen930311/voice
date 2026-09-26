@@ -1,7 +1,7 @@
 # 專案上下文 (Agent Context)：Voicebox
 
-> **最後更新時間**：2026-03-30 09:58
-> **自動生成**：由 `prepare_context.py` 產生，供 AI Agent 快速掌握專案全局
+> **最後更新時間**：2026-04-01 22:03（`prepare_context.py` 自動觸發已隨 auto-skill 系統於 2026-09-26 停用，本檔為最後一次生成的靜態快照，不再自動更新）
+> **狀態**：原由 `prepare_context.py` 產生；§4 內容已完整承接原 `.auto-skill-local.md`（該檔已於 2026-09-26 確認無資訊遺失後刪除）
 
 ---
 
@@ -38,23 +38,24 @@ Voicebox/
 │   └── voicebox.db
 ├── diary
 │   └── 2026
-│       └── 03
+│       ├── 03
+│       └── 04
+├── generate_audio.py
 ├── generate_narration_direct.py
 ├── id.txt
 ├── latest.json
 ├── output
-│   ├── arc_bench
-│   │   ├── tts_CPU_run1.wav
-│   │   └── tts_CPU_run2.wav
+│   ├── Adam_test_verification.wav
 │   ├── chatterbox_exaggeration_0.50.wav
 │   ├── chatterbox_exaggeration_0.85.wav
-│   ├── directml_bench
-│   │   └── qwen0.6B_cpu_run1.wav
+│   ├── i_am_a_women.wav
 │   ├── intro_clonetest_01.wav
 │   ├── intro_germany_ww2.wav
 │   ├── intro_narrator_male.wav
 │   ├── intro_ohtani_10s.wav
 │   ├── intro_ohtani_full.wav
+│   ├── mine_en_female.wav
+│   ├── mine_ww2_narrator.wav
 │   ├── output_sunny_day.wav
 │   ├── output_sunny_day_dramatic.wav
 │   ├── output_test.wav
@@ -62,16 +63,25 @@ Voicebox/
 │   ├── shohei_ohtani_final.wav
 │   ├── test_automation_flow.wav
 │   ├── test_dramatic.wav
+│   ├── test_en_female.wav
 │   ├── yan_cong_en.wav
 │   ├── 今天天氣真好.wav
 │   └── 英文解說1_dramatic.wav
 ├── partial.plist
 ├── sample
+│   ├── ElevenLabs_2026-01-21T17_23_18_Adam - Dominant, Firm_pre_sp97_s60_sb68_se0_b_m2.mp3
+│   ├── ElevenLabs_Adam_reference.wav
+│   ├── Listen and Repeat_ Speak with me in English_128k.mp3
 │   ├── What if Germany won WW2 #shorts #4k #history #extra_320k.mp3
 │   ├── __RLsnZv7q9v0_28s_normalized.mp3
+│   ├── adam_normalized.wav
+│   ├── adam_ref.wav
 │   ├── sample.wav
+│   ├── segment_10s.mp3
+│   ├── segment_clear_10s.mp3
 │   ├── shohei_ohtani_sample.wav
 │   ├── shohei_ohtani_sample_10s.wav
+│   ├── temp_short_segment.mp3
 │   ├── ww2_narrator_28s.wav
 │   ├── ww2_narrator_28s_norm.wav
 │   └── 大谷翔平為何放棄直接挑戰大聯盟？改變大谷一生的男人_1080p.mp4
@@ -224,7 +234,7 @@ Voicebox/
 ```
 
 ## 🏛️ 4. 架構與設計約定 (Architecture & Conventions)
-_(來自專案 L1 快取 `.auto-skill-local.md`)_
+_(原內容來自專案 L1 快取 `.auto-skill-local.md`；該檔已於 2026-09-26 刪除，本節現為唯一副本)_
 
 # 🏠 專案本地經驗 (L1 Cache)
 
@@ -254,9 +264,20 @@ _(來自專案 L1 快取 `.auto-skill-local.md`)_
 - `voicebox_clone_voice` 整合三步為一：建 Profile → Whisper 轉錄 → 上傳音訊
 - 根目錄組織規範：所有 `.py` 腳本存入 `scripts/`，臨時數據存入 `scripts/debug/`，執行檔與資源存入 `bin/`。
 
+## 🎬 Social-v3-lean 串聯 Golden Path
+<!-- Remotion 影片流水線的標準配音流程 -->
+- **Social 專用工具**：直接呼叫 `voicebox_generate_for_social`，不要手動帶 profile_id 或 output_path
+- **Social 預設 Profile**：`Germany WW2 Shorts` → ID `f9b3a288-2e86-4156-8dfd-42b70ece7283`（英文旁白首選，32 次驗證）
+- **Social 輸出路徑**：`C:/Users/Allen/OneDrive/Desktop/remotion/public/narration.wav`（Remotion 固定讀取此路徑）
+- **中文旁白 Profile**：`解說男聲` → ID `27883698-73ed-484f-965d-899b89ae99af`
+- **標準引擎**：`qwen 1.7B`（英文），`chatterbox`（中文需要克隆感）
+- **一次完整流程**：`voicebox_generate_for_social(text="...", language="en")` → 音訊自動存入 Remotion public/
+
 ## ⚠️ Known Issues
 <!-- 已知但暫未修復的問題與暫行解法 -->
-- 尚未實際測試（後端未啟動、無模型下載），需先完成 `just setup-python` + 模型下載
+- ✅ 完整自動化流程已驗證（2026-03-30）：start_backend → generate → poll → download 穩定
+- **`voicebox_generate` MCP Error ≠ 失敗**：任務已提交後台，直接 poll `voicebox_history` 即可，**絕對不要重試**，重試會生成重複音檔浪費時間
+- 冷啟動路徑（後端完全未運行）尚未實際觸發測試
 
 ## 🔧 常用指令
 <!-- 本專案頻繁使用的 CLI 指令速查 -->
@@ -271,10 +292,10 @@ _(來自專案 L1 快取 `.auto-skill-local.md`)_
 
 
 ## 🚦 5. 目前進度與待辦 (Current Status & TODO)
-_(自動提取自最近日記 2026-03-30)_
+_(自動提取自最近日記 2026-04-01)_
 
 ### 🚧 待辦事項
-- [ ] 重啟 Voicebox server，重新生成正確解說詞（由我撰寫的 gen_taiwan_narration.py）
-- [ ] 確認渲染完成的 `TaiwanFlyover_v2.mp4` 音影同步是否正確
-- [ ] 評估是否需要改用 MapTiler vector tiles 以顯示 3D 建築（台北101真實3D外觀）
+- [ ] 觀察 MCP 在更新後的使用穩定度。
+- [ ] 考慮將 generate_audio.py 的邏輯整合入更穩定的工具鏈。
+- [ ] 測試長文本生成的效能表現。
 

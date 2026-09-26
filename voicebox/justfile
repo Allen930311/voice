@@ -294,24 +294,25 @@ test: _ensure-venv
 
 # ─── Database ─────────────────────────────────────────────────────────
 
-# Initialize SQLite database
+# Initialize SQLite database (resolves to project root data/ via config.py)
 [unix]
 db-init: _ensure-venv
-    {{ python }} -c "from backend.database import init_db; init_db()"
+    {{ python }} -m backend.main --help > /dev/null 2>&1 || true
+    {{ python }} -c "from backend import config, database; database.init_db()"
 
 [windows]
 db-init: _ensure-venv
-    & "{{ python }}" -c "from backend.database import init_db; init_db()"
+    & "{{ python }}" -c "from backend import config, database; database.init_db()"
 
-# Reset database (delete + reinit)
+# Reset database (delete root data/voicebox.db + reinit)
 [unix]
 db-reset:
-    rm -f {{ backend_dir }}/data/voicebox.db
+    rm -f ../data/voicebox.db
     just db-init
 
 [windows]
 db-reset:
-    if (Test-Path "{{ backend_dir }}/data/voicebox.db") { Remove-Item -Force "{{ backend_dir }}/data/voicebox.db" }
+    if (Test-Path "../data/voicebox.db") { Remove-Item -Force "../data/voicebox.db" }
     just db-init
 
 # ─── Utilities ────────────────────────────────────────────────────────
