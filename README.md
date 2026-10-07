@@ -7,6 +7,24 @@
 
 ---
 
+## 🚦 Current Operating State
+
+Fresh-agent entry: [`AGENT_CONTEXT.md`](AGENT_CONTEXT.md).
+
+The current commercial-validation direction is
+[`voicebox/docs/plans/COMMERCIAL_VOICEOVER_VALIDATION.md`](voicebox/docs/plans/COMMERCIAL_VOICEOVER_VALIDATION.md).
+It is `PROPOSED` with `implementation_authorization: none`.
+
+Current next gate: select one concrete customer job / workload, exercise the
+existing product first, then decide whether the result is
+`GO_EXISTING_CAPABILITY`, `GO_BOUNDED_GAP`, `HOLD_EVIDENCE`, or `REJECT`.
+Do not build a new TTS backend merely because the repository can support one.
+
+`voicebox/docs/PROJECT_STATUS.md` is a dated engineering inventory (2026-04-18).
+Use it for architecture/history, not as a live issue-count or priority queue.
+
+---
+
 ## 🏗️ Project Structure | 專案架構
 
 This repository is a unified workspace containing the Voicebox app, its MCP server, and automation scripts.
